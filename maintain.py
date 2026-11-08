@@ -50,6 +50,7 @@ META_LAST_RUN = "maintenance_last_run"
 META_OPEN_QUESTIONS = "open_questions"
 # The pairs found by the last tick, so the prefetch path can raise one without a sweep.
 META_CONFLICTS = "maintenance_conflicts"
+META_DUPLICATES = "maintenance_duplicates"
 DEFAULT_INTERVAL_HOURS = 24
 DEFAULT_BUDGET_MS = 2000
 
@@ -455,9 +456,11 @@ def run_maintenance(store, vault_root, memory_rel, *, embedder=None,
             # Keep the pair list where a turn can reach it cheaply: the prefetch path
             # must not pay for a sweep. Replaced wholesale each tick, so a conflict
             # that a human resolved stops being raised.
-            store.set_meta(META_CONFLICTS, json.dumps(
-                [{"a": a, "b": b, "score": s, "at": report.ran_at}
-                 for a, b, s in report.conflicts][:MAX_LISTED]))
+            for key, pairs in ((META_CONFLICTS, report.conflicts),
+                               (META_DUPLICATES, report.duplicates)):
+                store.set_meta(key, json.dumps(
+                    [{"a": a, "b": b, "score": s, "at": report.ran_at}
+                     for a, b, s in pairs][:MAX_LISTED]))
         except Exception:
             report.written = False
     return report

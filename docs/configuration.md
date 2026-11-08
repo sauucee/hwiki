@@ -130,6 +130,17 @@ The contradiction and duplicate sweeps use deterministic signals by default. Wit
 `HWIKI_NLI_CONFLICT=1` the model is also consulted — on a 14-fact vault that found a
 swapped-value contradiction the token rules miss.
 
+### Prompt budget (`max_context_tokens`)
+
+```json
+{ "max_context_tokens": 1200 }
+```
+
+Caps the whole injected recall block, not a hit count. Estimated at 4 characters per
+token, whole blocks only — a block is either in or out, never cut mid-sentence — and at
+least one block always survives. Priority: recalled facts, then gaps/conflicts/duplicates,
+then builtin memory, then wiki text. `0` disables the cap.
+
 ### Choosing a tier by cost
 
 | tier | RSS | recall p50 | disk |

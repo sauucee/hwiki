@@ -219,8 +219,64 @@ def lint_memory(store, *, memory_dir: Optional[Path] = None,
                        f"same claim accepted on {len(owners)} pages: {', '.join(owners)}")
 
     _lint_catalog(report, root, pages, rel_root)
+    _lint_orphans(report, root, pages, rel_root)
     _lint_answers(report, mem, rel_root, pages)
     return report
+
+
+def _lint_orphans(report: LintReport, root: Path, pages: Iterable[Path],
+                  rel_root: Path) -> None:
+    """Pages that nothing navigates to.
+
+    The pattern calls these orphans: no inbound links. In this wiki navigation is the
+    catalog ("read index.md first"), so a catalog entry is an inbound route and counts.
+    A page with neither a link nor an entry is reachable only by luck.
+
+    Deliberately INFO, and deliberately quiet for generated artifacts: the maintenance
+    report, catalogs and filed answers are entry points by design, and flagging them every
+    run would train the reader to ignore the check.
+    """
+    pages = list(pages)
+    inbound = {}
+    for path in pages:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for target in _wikilink_targets(text):
+            inbound.setdefault(target.strip().lower(), set()).add(path.stem)
+
+    listed = set()
+    index = root / "index.md"
+    if index.exists():
+        try:
+            listed = {t.strip().lower() for t in
+                      _wikilink_targets(index.read_text(encoding="utf-8", errors="replace"))}
+        except OSError:
+            listed = set()
+
+    for path in pages:
+        slug = path.stem.lower()
+        if path.parent.name == "answers":
+            continue  # answer.unreferenced already covers filed answers
+        try:
+            meta = _frontmatter(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if meta.get("status") == "generated" or meta.get("type") in ("maintenance", "log"):
+            continue
+        if slug in listed:
+            continue
+        backlinks = inbound.get(slug, set()) - {path.stem}
+        if backlinks:
+            continue
+        try:
+            rel = path.relative_to(rel_root).as_posix()
+        except ValueError:
+            rel = path.name
+        report.add("link.orphan", INFO, rel,
+                   "no inbound links and not listed in index.md; nothing navigates here")
+
 
 
 def _lint_catalog(report: LintReport, root: Path, pages: Iterable[Path],

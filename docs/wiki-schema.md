@@ -242,6 +242,17 @@ hypothesis, and entailment(question, claim) measured zero signal. Do not rebuild
 Failure mode is explicit: a missing bundle raises `NliUnavailable`, callers keep the
 previous behaviour, and nothing is guessed.
 
+### Lint checks
+
+`hermes hwiki lint [--semantic] [--info]` reports, in one read-only pass: missing
+frontmatter, a page with no `# claim`, supersession links that point nowhere, dangling
+`[[wikilinks]]`, the same claim accepted on two pages, catalog drift in both directions,
+orphan pages (`link.orphan`, INFO: no inbound link and no `index.md` entry), unreferenced
+filed answers, and secret-shaped content.
+
+An orphan is INFO rather than a warning: it is not rot, it is a page nothing navigates to.
+Generated artifacts and filed answers are exempt — they are entry points by design.
+
 ## 13. Autonomous maintenance
 
 `hermes hwiki maintain` (and the scheduled tick behind the turn hook) sweeps memory

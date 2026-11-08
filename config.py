@@ -52,6 +52,9 @@ DEFAULTS: Dict[str, Any] = {
     "demote_paths": ["log.md", "index.md", "wiki/memory/builtin-mirror.md",
                      "maintenance.md"],
     "fetch_multiplier": 4,          # candidate over-fetch factor
+    # Prompt budget for the injected block. ~4 chars/token, whole blocks only, and 0
+    # disables the cap (the pre-2026-11 behaviour of capping by hit count alone).
+    "max_context_tokens": 1200,
     "mirror_builtin_memory": True,
     "mirror_page": "builtin-mirror",
     # LLM-wiki navigation artifacts (derived, regenerated on write).

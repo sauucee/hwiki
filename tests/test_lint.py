@@ -189,6 +189,55 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
+class OrphanTests(LintTests):
+    """Nothing navigates to it: no inbound link, no catalog entry."""
+
+    def _note(self, name, body, *, generated=False):
+        meta = ("---\ntitle: Note\nstatus: generated\ntype: maintenance\n---\n\n"
+                if generated else "---\ntitle: Note\n---\n\n")
+        path = self.mem / f"{name}.md"
+        path.write_text(meta + body, encoding="utf-8")
+        return path
+
+    def test_an_unlinked_page_is_an_orphan(self):
+        self._note("lonely", "Nobody points here.\n")
+        report = lint_memory(self.store)
+        self.assertIn("link.orphan", [c for c, _s in self.checks(report)])
+
+    def test_a_catalog_entry_counts_as_navigation(self):
+        page = self._note("listed", "Catalogued, so it is reachable.\n")
+        (self.root / "index.md").write_text(
+            f"# Index\n\n- [[{page.stem}]] — a note\n", encoding="utf-8")
+        report = lint_memory(self.store)
+        self.assertNotIn("link.orphan", [c for c, _s in self.checks(report)])
+
+    def test_an_inbound_link_clears_it(self):
+        target = self._note("target", "Linked from a fact page.\n")
+        self.fact_page(f"See [[{target.stem}]] for context")
+        report = lint_memory(self.store)
+        orphans = [f for f in report.findings if f.check == "link.orphan"]
+        self.assertNotIn(str(target.relative_to(self.root)), [f.page for f in orphans])
+
+    def test_generated_artifacts_are_not_orphans(self):
+        self._note("maintenance", "Generated every tick.\n", generated=True)
+        report = lint_memory(self.store)
+        orphans = [f for f in report.findings if f.check == "link.orphan"]
+        self.assertEqual([o.page for o in orphans if "maintenance" in o.page], [])
+
+    def test_it_is_info_not_a_warning(self):
+        self._note("quiet", "Nothing links here.\n")
+        report = lint_memory(self.store)
+        orphans = [f for f in report.findings if f.check == "link.orphan"]
+        self.assertTrue(orphans)
+        self.assertTrue(all(f.severity == "info" for f in orphans))
+
+    def test_a_self_link_does_not_count_as_inbound(self):
+        page = self._note("navel", "Gazing at [[navel]].\n")
+        report = lint_memory(self.store)
+        self.assertIn(str(page.stem), " ".join(
+            f.page for f in report.findings if f.check == "link.orphan"))
+
+
 class SemanticSuggestionTests(unittest.TestCase):
     """The semantic pass may only *suggest*. It is advisory, read-only, and it
     must never declare a contradiction or resolve one.

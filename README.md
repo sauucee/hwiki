@@ -279,13 +279,20 @@ python3 tests/eval_capabilities.py   # 32 probes: Honcho's documented surfaces
 python3 tests/bench_footprint.py     # RSS / latency / disk per tier
 ```
 
-Current: **20/25** pattern elements fully demonstrated, **10 YES / 12 PARTIAL / 10 NO**
+Current: **21/25** pattern elements fully demonstrated, **11 YES / 11 PARTIAL / 10 NO**
 against Honcho's docs. Every `YES` has an assertion behind it, and a probe that crashes is
 recorded as `NO` with its exception, so a broken probe cannot pass as a gap.
 
 The `NO` rows cluster into one capability — generation. Deduction, induction, dialectic
 and session summaries all need a model that writes prose: 2–8 GB of RSS against this
 project's **1.4 MB** with no model at all. That is a scope decision, not a backlog item.
+
+## Prompt budget
+
+The injected block is capped by `max_context_tokens` (default 1200; `0` disables), not by
+a hit count. Blocks are whole: recalled facts first, then gaps/conflicts/duplicates, then
+builtin memory, then wiki text; a block is either included or dropped, never cut
+mid-sentence, and at least one always survives.
 
 ## Autonomous maintenance
 
@@ -318,6 +325,10 @@ Recorded questions are not just written down: when the current query is about on
 of them, the prefetch block says so explicitly — *"Memory gaps this looks like (ask,
 do not assume)"*. Memory that knows what it does not know can ask, instead of
 improvising an answer.
+
+Duplicates work the same way — the tick records the pairs it found, and a query about one
+is told *"This fact is recorded twice — do not add a third copy"* rather than quietly
+getting a third copy.
 
 Contradictions work the same way. The pairs a tick finds are kept in meta, so a
 conversation about one of them gets both sides quoted — *"Two stored facts disagree —

@@ -562,20 +562,28 @@ def probe_deletion(emb):
 
 
 def probe_context_budget(emb):
-    """context() fits a token limit. hwiki caps counts, not tokens."""
+    """context() must fit a token limit. hwiki now caps the injected block."""
     lab = Lab(emb)
     try:
-        parts = []
+        from hwiki import WikiMemoryProvider
         for i in range(12):
             lab.fact(f"Fact number {i} about the deployment pipeline and its stages")
-        from hwiki.facts_provider import FactsEngine
-        engine = FactsEngine(str(Path(lab.tmp.name)), lab.root, MEMORY_REL,
-                             config={"compile_enabled": False})
-        block = engine._format_fact_recall(
-            lab.store.recall("deployment pipeline", limit=12))
-        row("Context with a token budget", "PARTIAL",
-            f"prefetch caps at a hit count ({len(block)} chars for 12 facts); there is "
-            "no token accounting")
+        provider = WikiMemoryProvider(config={
+            "wiki_path": str(lab.root), "memory_dir": str(MEMORY_REL),
+            "index_path": str(lab.home / "index.sqlite"), "reindex_interval_s": 0,
+            "_hermes_home": str(lab.home), "embeddings": {"mode": "hash"},
+            "facts": {"compile_enabled": False}, "max_context_tokens": 150,
+        })
+        provider.initialize("s1", hermes_home=str(lab.home), platform="cli")
+        try:
+            block = provider.prefetch("deployment pipeline stages")
+            tokens = (len(block) + 3) // 4
+            ok = block and tokens <= 150
+            row("Context with a token budget", "YES" if ok else "PARTIAL",
+                f"injected block is {len(block)} chars (~{tokens} tokens) under a "
+                f"150-token budget; whole blocks are dropped, never cut mid-sentence")
+        finally:
+            provider.shutdown()
     finally:
         lab.close()
 

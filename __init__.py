@@ -261,6 +261,15 @@ WIKI_CONFIDENCE_SCHEMA = {
 # Provider
 # ---------------------------------------------------------------------------
 
+def _estimate_tokens(text: str) -> int:
+    """Crude prompt-size estimate: 4 characters per token.
+
+    Deliberately not a tokenizer: the budget has to be free to compute on every turn, and
+    being 20% wrong is harmless when the failure mode is "one block fewer".
+    """
+    return (len(text or "") + 3) // 4
+
+
 class WikiMemoryProvider(MemoryProvider):
     """Markdown wiki as Hermes long-term memory."""
 
@@ -544,7 +553,12 @@ class WikiMemoryProvider(MemoryProvider):
 
     def _fuse_recall(self, query: str, wiki_part: str) -> str:
         """Per-turn dynamic injection: approved facts + builtin lines + wiki."""
-        parts: List[str] = []
+        blocks: List[tuple] = []  # (priority, text); lower priority number = kept first
+
+        def add(text: str, priority: int) -> None:
+            if text:
+                blocks.append((priority, text))
+
         if self._facts is not None:
             try:
                 fact_hits = self._facts.recall_facts(query, limit=6)
@@ -554,26 +568,47 @@ class WikiMemoryProvider(MemoryProvider):
                         found = self._facts.store().neighbors([hit["id"]], limit=2)
                         if found:
                             neighbors[hit["id"]] = found
-                    block = self._facts._format_fact_recall(fact_hits, neighbors=neighbors)
-                    if block:
-                        parts.append(block)
+                    add(self._facts._format_fact_recall(fact_hits, neighbors=neighbors), 0)
+                add(self._open_question_hint(query), 1)
+                add(self._pair_hint(query, "conflicts"), 1)
+                add(self._pair_hint(query, "duplicates"), 1)
                 builtin_lines = self._facts.builtin_recall_lines(query, self._facts.store().embedder)
                 if builtin_lines:
-                    parts.append("**From Hermes builtin memory (read-only):**\n"
-                                 + "\n".join(builtin_lines))
-                gap = self._open_question_hint(query)
-                if gap:
-                    parts.append(gap)
-                disagreement = self._conflict_hint(query)
-                if disagreement:
-                    parts.append(disagreement)
+                    add("**From Hermes builtin memory (read-only):**\n"
+                        + "\n".join(builtin_lines), 2)
             except Exception as exc:
                 logger.debug("wiki memory: fact recall fusion failed: %s", exc)
-        if wiki_part:
-            parts.append(wiki_part)
-        if not parts:
+        add(wiki_part, 3)
+        kept = self._apply_token_budget(blocks)
+        if not kept:
             return ""
-        return "## Memory (recalled)\n\n" + "\n\n".join(parts)
+        return "## Memory (recalled)\n\n" + "\n\n".join(text for _p, text in kept)
+
+    def _apply_token_budget(self, blocks: List[tuple]) -> List[tuple]:
+        """Keep the highest-value blocks until the token budget is spent.
+
+        Honcho's ``context()`` takes a token limit; this used to cap by hit count, which
+        says nothing about prompt size. The estimate is deliberately crude — 4 characters
+        per token — because it has to cost nothing on the turn path. Whole blocks are
+        dropped, never cut mid-sentence, and the caller's display order is preserved.
+        """
+        try:
+            budget = int(self._config.get("max_context_tokens") or 0)
+        except (TypeError, ValueError):
+            budget = 0
+        if budget <= 0:
+            return blocks
+        order = sorted(range(len(blocks)), key=lambda i: (blocks[i][0], i))
+        kept: List[int] = []
+        spent = 0
+        for index in order:
+            cost = _estimate_tokens(blocks[index][1])
+            if kept and spent + cost > budget:
+                continue          # skip this block, still try smaller higher-priority ones
+            kept.append(index)
+            spent += cost
+        chosen = set(kept)
+        return [blocks[i] for i in range(len(blocks)) if i in chosen]
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Warm the next turn's recall in the background."""
@@ -592,14 +627,23 @@ class WikiMemoryProvider(MemoryProvider):
 
         threading.Thread(target=_run, daemon=True, name="wiki-memory-prefetch").start()
 
-    def _conflict_hint(self, query: str) -> str:
-        """Raise a recorded fact pair that disagrees about what this is about.
+    _PAIR_HINTS = {
+        # meta key -> (heading, closing line). Both hints quote the pair and refuse to
+        # rank it: the memory is not entitled to decide which claim is right.
+        "conflicts": ("**Two stored facts disagree — ask which is right:**",
+                      "Neither has been changed."),
+        "duplicates": ("**This fact is recorded twice — do not add a third copy:**",
+                       "Both pages are still here; consolidating them is a review step."),
+    }
 
-        The maintenance tick stores the pairs it found; reusing them keeps the read
-        path free (no sweep, no model). Both sides are quoted and neither is ranked, so
-        the agent cannot silently pick the one that reads better — the point is to make
-        it ask.
+    def _pair_hint(self, query: str, kind: str) -> str:
+        """Raise a pair the maintenance tick recorded (conflict or duplicate).
+
+        The tick stores what it found, so the read path pays nothing: two meta keys, no
+        sweep, no model. Similarity is containment against the union of both claims,
+        because the query is short and a stored claim is long.
         """
+        heading, closing = self._PAIR_HINTS[kind]
         try:
             import json as _json
             from . import maintain as maintain_mod
@@ -609,9 +653,10 @@ class WikiMemoryProvider(MemoryProvider):
                 import maintain as maintain_mod  # type: ignore
             except ImportError:
                 return ""
+        meta_key = (maintain_mod.META_CONFLICTS if kind == "conflicts"
+                    else maintain_mod.META_DUPLICATES)
         try:
-            pairs = _json.loads(
-                self._facts.store().get_meta(maintain_mod.META_CONFLICTS) or "[]")
+            pairs = _json.loads(self._facts.store().get_meta(meta_key) or "[]")
         except Exception:
             return ""
         if not isinstance(pairs, list) or not pairs:
@@ -619,7 +664,7 @@ class WikiMemoryProvider(MemoryProvider):
         try:
             tokenise = facts_mod._tokens
         except AttributeError:
-            logger.debug("wiki memory: token helper unavailable; no conflict hint")
+            logger.debug("wiki memory: token helper unavailable; no %s hint", kind)
             return ""
         query_tokens = set(tokenise(query))
         if not query_tokens:
@@ -637,10 +682,10 @@ class WikiMemoryProvider(MemoryProvider):
             score = len(shared) / max(1, min(len(query_tokens), len(reach)))
             if score < 0.6:
                 continue
-            return ("**Two stored facts disagree — ask which is right:**\n"
+            return (f"{heading}\n"
                     f"- \"{a[:160]}\"\n"
                     f"- \"{b[:160]}\"\n"
-                    "Neither has been changed.")
+                    f"{closing}")
         return ""
 
     def _open_question_hint(self, query: str) -> str:

@@ -392,6 +392,108 @@ class ConflictHintTests(GapHintTests):
         self.assertIn("disagree", block)
 
 
+class DuplicateHintTests(GapHintTests):
+    """A fact already recorded twice must not get a third copy silently."""
+
+    def _record_duplicate(self):
+        self.provider._facts.store().set_meta(maintain.META_DUPLICATES, json.dumps([
+            {"a": "Backups run nightly with restic to B2",
+             "b": "Backups run nightly with restic into B2",
+             "score": 0.93, "at": "2026-11-08T00:00:00+00:00"}]))
+
+    def test_a_relevant_duplicate_is_raised(self):
+        self._record_duplicate()
+        block = self.provider.prefetch("when do backups run with restic?")
+        self.assertIn("recorded twice", block)
+        self.assertIn("Backups run nightly with restic to B2", block)
+
+    def test_it_warns_against_a_third_copy(self):
+        self._record_duplicate()
+        block = self.provider.prefetch("when do backups run with restic?")
+        self.assertIn("third copy", block)
+
+    def test_an_unrelated_query_stays_quiet(self):
+        self._record_duplicate()
+        self.assertEqual(self.provider.prefetch("which editor do they use"), "")
+
+    def test_conflicts_and_duplicates_do_not_hide_each_other(self):
+        self.provider._facts.store().set_meta(maintain.META_DUPLICATES, json.dumps([
+            {"a": "Backups run nightly with restic to B2",
+             "b": "Backups run nightly with restic into B2", "score": 0.93, "at": "x"}]))
+        self.provider._facts.store().set_meta(maintain.META_CONFLICTS, json.dumps([
+            {"a": "Deploys are allowed on Fridays",
+             "b": "Deploys are never allowed on Fridays", "score": 1.0, "at": "x"}]))
+        dup = self.provider.prefetch("do backups run with restic nightly?")
+        con = self.provider.prefetch("are deploys allowed on fridays?")
+        self.assertIn("recorded twice", dup)
+        self.assertIn("disagree", con)
+        self.assertNotIn("disagree", dup)
+
+
+class TokenBudgetTests(GapHintTests):
+    """Prefetch must respect a prompt budget, not just a hit count."""
+
+    def _provider_with(self, tokens):
+        from hwiki import WikiMemoryProvider
+
+        provider = WikiMemoryProvider(config={
+            "wiki_path": str(self.wiki), "memory_dir": "Hermes/Memory/Auto",
+            "index_path": str(self.home / "index.sqlite"), "reindex_interval_s": 0,
+            "_hermes_home": str(self.home), "embeddings": {"mode": "hash"},
+            "facts": {"compile_enabled": False}, "max_context_tokens": tokens,
+        })
+        provider.initialize("s1", hermes_home=str(self.home), platform="cli")
+        return provider
+
+    def test_low_priority_blocks_are_dropped_first(self):
+        provider = self._provider_with(60)
+        try:
+            blocks = [(3, "w" * 2000), (0, "f" * 80)]
+            kept = provider._apply_token_budget(blocks)
+            self.assertEqual([text[:1] for _p, text in kept], ["f"])
+        finally:
+            provider.shutdown()
+
+    def test_whole_blocks_are_never_cut(self):
+        provider = self._provider_with(60)
+        try:
+            block = "f" * 80
+            kept = provider._apply_token_budget([(0, block)])
+            self.assertEqual(kept[0][1], block)
+        finally:
+            provider.shutdown()
+
+    def test_zero_disables_the_cap(self):
+        provider = self._provider_with(0)
+        try:
+            blocks = [(0, "f" * 80), (3, "w" * 4000)]
+            self.assertEqual(len(provider._apply_token_budget(blocks)), 2)
+        finally:
+            provider.shutdown()
+
+    def test_the_injected_block_fits_the_budget(self):
+        provider = self._provider_with(90)
+        try:
+            store = provider._facts.store()
+            store.set_meta(maintain.META_CONFLICTS, json.dumps([{
+                "a": "Deploys are allowed on Fridays",
+                "b": "Deploys are never allowed on Fridays", "score": 1.0, "at": "x"}]))
+            block = provider.prefetch("are deploys allowed on fridays?")
+            self.assertLessEqual((len(block) + 3) // 4, 90 + 40)  # header overhead
+        finally:
+            provider.shutdown()
+
+    def test_a_short_query_still_gets_its_hint_under_a_tight_budget(self):
+        provider = self._provider_with(40)
+        try:
+            provider._facts.store().set_meta(maintain.META_OPEN_QUESTIONS, json.dumps(
+                ["when are deploys allowed on fridays?"]))
+            block = provider.prefetch("are deploys allowed on fridays?")
+            self.assertIn("Memory gaps", block)
+        finally:
+            provider.shutdown()
+
+
 class ReportExclusionTests(GapHintTests):
     """The generated report is an artifact; it must never be recalled as knowledge."""
 
