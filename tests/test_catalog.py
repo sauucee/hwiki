@@ -16,6 +16,8 @@ from pathlib import Path
 
 import _hwiki_path  # noqa: F401,E402  (registers the repo root as package `hwiki`)
 
+from hwiki import catalog, maintain  # noqa: E402
+from hwiki.facts import Embedder, ProposalStore  # noqa: E402
 from hwiki.catalog import (  # noqa: E402
     INDEX_FILENAME,
     LOG_FILENAME,
@@ -270,3 +272,85 @@ class LogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class OwnershipGuardTests(unittest.TestCase):
+    """A generated artifact must never overwrite something a person wrote."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.store = WikiStore(self.root, memory_dir="mem")
+        (self.root / "mem").mkdir()
+        (self.root / "mem" / "a-fact.md").write_text(
+            "---\ntitle: A Fact\n---\n\n# A Fact\n\nStaging stays on Fly.io.\n",
+            encoding="utf-8")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_hand_written_index_is_left_alone(self):
+        index = self.root / "index.md"
+        mine = "# My Vault\n\n- [[Home]]\n- [[Project X]]\n"
+        index.write_text(mine, encoding="utf-8")
+        self.assertIsNone(catalog.write_index(self.store, memory_dir="mem"))
+        self.assertEqual(index.read_text(encoding="utf-8"), mine)
+
+    def test_a_hand_written_index_is_replaced_only_on_explicit_force(self):
+        index = self.root / "index.md"
+        index.write_text("# My Vault\n", encoding="utf-8")
+        written = catalog.write_index(self.store, memory_dir="mem", force=True)
+        self.assertIsNotNone(written)
+        self.assertIn("hwiki-catalog", index.read_text(encoding="utf-8"))
+
+    def test_a_generated_index_is_regenerated_normally(self):
+        index = self.root / "index.md"
+        catalog.write_index(self.store, memory_dir="mem")
+        index.write_text(index.read_text(encoding="utf-8") + "\nstale line\n")
+        catalog.write_index(self.store, memory_dir="mem")
+        self.assertNotIn("stale line", index.read_text(encoding="utf-8"))
+
+    def test_a_missing_index_is_created(self):
+        self.assertIsNotNone(catalog.write_index(self.store, memory_dir="mem"))
+        self.assertTrue((self.root / "index.md").exists())
+
+    def test_a_hand_written_log_is_not_appended_to(self):
+        log = self.root / "log.md"
+        mine = "# My Log\n\n- 2026: something I wrote\n"
+        log.write_text(mine, encoding="utf-8")
+        self.assertIsNone(catalog.append_log(self.store, "accept", "x"))
+        self.assertEqual(log.read_text(encoding="utf-8"), mine)
+
+    def test_the_guard_reads_frontmatter_only(self):
+        """A marker quoted inside the body is not a claim of ownership."""
+        index = self.root / "index.md"
+        index.write_text("# Notes\n\nThe generated file says `source: hwiki-catalog`.\n",
+                         encoding="utf-8")
+        self.assertFalse(catalog.owns_artifact(index))
+
+    def test_the_tick_regenerates_a_stale_generated_index(self):
+        """The artifacts job must actually fire — reading the wrong Finding field once
+        made it report "catalogs current" forever."""
+        catalog.write_index(self.store, memory_dir="mem")
+        index = self.root / "index.md"
+        index.write_text(
+            "---\ntitle: Wiki Index\nsource: hwiki-catalog\n---\n\n# Wiki Index\n\n"
+            "- [[gone-page]]\n", encoding="utf-8")
+        store = ProposalStore(self.root / "facts.sqlite", embedder=Embedder(mode="hash"))
+        report = maintain.run_maintenance(store, self.root, "mem", write=True)
+        note = " ".join(n for job in report.jobs for n in job.notes)
+        self.assertIn("regenerated index.md", note)
+        self.assertNotIn("gone-page", index.read_text(encoding="utf-8"))
+
+    def test_the_tick_leaves_a_hand_written_index_alone(self):
+        index = self.root / "index.md"
+        index.write_text("# My Vault\n", encoding="utf-8")
+        store = ProposalStore(self.root / "facts.sqlite",
+                              embedder=Embedder(mode="hash"))
+        # a catalog that lies about the vault is what makes the tick want to regenerate
+        (self.root / "index.md").write_text("# My Vault\n\n- [[gone-page]]\n",
+                                            encoding="utf-8")
+        report = maintain.run_maintenance(store, self.root, "mem", write=True)
+        note = " ".join(n for job in report.jobs for n in job.notes)
+        self.assertIn("My Vault", (self.root / "index.md").read_text(encoding="utf-8"))
+        self.assertIn("left alone", note)

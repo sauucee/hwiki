@@ -16,7 +16,8 @@ from pathlib import Path
 
 import _hwiki_path  # noqa: F401,E402
 
-from hwiki import maintain  # noqa: E402
+from hwiki import catalog, maintain  # noqa: E402
+from hwiki.store import WikiStore  # noqa: E402
 from hwiki.facts import Embedder, ProposalStore  # noqa: E402
 
 MEMORY_REL = "Hermes/Memory/Auto"
@@ -587,3 +588,87 @@ class RenderTests(_Vault):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class DryRunWritesNothingTests(unittest.TestCase):
+    """`--dry-run` is documented as "nothing written" — assert that on every job.
+
+    A live dry run once regenerated the vault's index.md and rebuilt the facts DB: the
+    `write` flag only gated the meta bookkeeping, not the jobs themselves.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.mem = self.root / "mem"
+        self.mem.mkdir()
+        self.store = ProposalStore(self.root / "facts.sqlite",
+                                  embedder=Embedder(mode="hash"))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _vault_page(self, name, text):
+        path = self.mem / name
+        path.write_text(
+            f"---\ntitle: {name}\n---\n\n# {name}\n\n{text}\n", encoding="utf-8")
+        return path
+
+    def _snapshot(self):
+        return {p.name: (p.stat().st_mtime_ns, p.read_bytes())
+                for p in self.mem.glob("*.md")}
+
+    def _tick(self, **kwargs):
+        return maintain.run_maintenance(self.store, self.root, "mem", **kwargs)
+
+    def test_a_dry_run_does_not_rewrite_the_index(self):
+        self._vault_page("fact-a.md", "Staging stays on Fly.io.")
+        catalog.write_index(WikiStore(self.root, memory_dir="mem"), memory_dir="mem")
+        index = self.root / "index.md"
+        index.write_text(
+            "---\ntitle: Wiki Index\nsource: hwiki-catalog\n---\n\n# Wiki Index\n\n"
+            "- [[gone-page]]\n", encoding="utf-8")
+        before = (index.stat().st_mtime_ns, index.read_bytes())
+        self._tick(write=False)
+        self.assertEqual((index.stat().st_mtime_ns, index.read_bytes()), before)
+
+    def test_a_dry_run_says_what_it_would_do(self):
+        self._vault_page("fact-a.md", "Staging stays on Fly.io.")
+        catalog.write_index(WikiStore(self.root, memory_dir="mem"), memory_dir="mem")
+        (self.root / "index.md").write_text(
+            "---\ntitle: Wiki Index\nsource: hwiki-catalog\n---\n\n# Wiki Index\n\n"
+            "- [[gone-page]]\n", encoding="utf-8")
+        report = self._tick(write=False)
+        note = " ".join(n for job in report.jobs for n in job.notes)
+        self.assertIn("would regenerate", note)
+
+    def test_a_dry_run_does_not_heal_the_database(self):
+        self._vault_page("fact-a.md", "Staging stays on Fly.io.")
+        before = self.store.list_proposals(status="accepted", limit=100)
+        report = self._tick(write=False)
+        self.assertEqual(self.store.list_proposals(status="accepted", limit=100), before)
+        note = " ".join(n for job in report.jobs for n in job.notes)
+        self.assertIn("would recover", note)
+
+    def test_a_dry_run_leaves_vault_pages_untouched(self):
+        page = self._vault_page("fact-a.md", "Staging stays on Fly.io.")
+        before = self._snapshot()
+        self._tick(write=False)
+        self.assertEqual(self._snapshot(), before)
+        self.assertTrue(page.exists())
+
+    def test_a_dry_run_does_not_flush_open_questions(self):
+        buffer = maintain.QuestionBuffer()
+        buffer.note("what is the deploy window")
+        self._tick(write=False, question_buffer=buffer)
+        self.assertIn("what is the deploy window", buffer.drain())
+
+    def test_a_real_tick_does_write(self):
+        self._vault_page("fact-a.md", "Staging stays on Fly.io.")
+        catalog.write_index(WikiStore(self.root, memory_dir="mem"), memory_dir="mem")
+        index = self.root / "index.md"
+        index.write_text(
+            "---\ntitle: Wiki Index\nsource: hwiki-catalog\n---\n\n# Wiki Index\n\n"
+            "- [[gone-page]]\n", encoding="utf-8")
+        self._tick(write=True)
+        self.assertNotIn("gone-page", index.read_text(encoding="utf-8"))

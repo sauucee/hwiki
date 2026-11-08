@@ -104,7 +104,14 @@ class MaintenanceReport:
 
     @property
     def work_items(self) -> int:
-        return len(self.conflicts) + len(self.duplicates) + len(self.questions)
+        """Everything the tick found, not just the pairs: a heal or a stale catalog is work.
+
+        Excluding them made the headline read "0 work item(s)" on a vault where the tick
+        had just reported 4 recoverable pages and 14 stale catalog entries.
+        """
+        healed = sum(job.count for job in self.jobs if getattr(job, "name", "") == "heal")
+        return (len(self.conflicts) + len(self.duplicates) + len(self.questions)
+                + healed + len(self.stale_artifacts))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -348,11 +355,17 @@ def run_maintenance(store, vault_root, memory_rel, *, embedder=None,
             on_disk = len(list((vault_root / memory_rel).glob("*.md"))) \
                 if (vault_root / memory_rel).is_dir() else 0
             if on_disk > accepted:
-                result = store.rebuild_from_vault(vault_root, memory_rel)
                 heal.ran = True
-                heal.count = int(result.get("imported", 0))
-                if heal.count:
-                    heal.notes.append(f"recovered {heal.count} fact page(s) missing from the index")
+                if not write:
+                    heal.count = on_disk - accepted
+                    heal.notes.append(
+                        f"would recover {heal.count} fact page(s) missing from the index")
+                else:
+                    result = store.rebuild_from_vault(vault_root, memory_rel)
+                    heal.count = int(result.get("imported", 0))
+                    if heal.count:
+                        heal.notes.append(
+                            f"recovered {heal.count} fact page(s) missing from the index")
             else:
                 heal.ran = True
                 heal.notes.append("index matches the vault")
@@ -407,9 +420,17 @@ def run_maintenance(store, vault_root, memory_rel, *, embedder=None,
         questions.skipped = "no buffer (nothing asked this process)"
     else:
         try:
-            report.questions = question_buffer.merge_into(store)
-            questions.ran = True
-            questions.count = len(report.questions)
+            if write:
+                report.questions = question_buffer.merge_into(store)
+                questions.ran = True
+                questions.count = len(report.questions)
+            else:
+                pending = sorted(question_buffer._counts.values(), key=lambda p: (-p[1], p[0]))
+                report.questions = [text for text, _count in pending]
+                questions.ran = True
+                questions.count = len(report.questions)
+                if report.questions:
+                    questions.notes.append("would flush to meta")
         except Exception as exc:
             questions.skipped = f"error: {exc}"
     report.jobs.append(questions)
@@ -427,10 +448,21 @@ def run_maintenance(store, vault_root, memory_rel, *, embedder=None,
                     from catalog import write_index  # type: ignore
                 except ImportError:
                     write_index = None
-            if write_index is not None and remaining():
-                write_index(store)
+            wiki = _wiki_for_artifacts(store, vault_root, memory_rel)
+            if not write:
                 artifacts.ran = True
-                artifacts.notes.append(f"regenerated index.md ({len(stale)} stale entr(ies))")
+                artifacts.count = len(stale)
+                artifacts.notes.append(
+                    f"would regenerate index.md ({len(stale)} stale entr(ies))")
+            elif write_index is not None and wiki is not None and remaining():
+                written = write_index(wiki)
+                artifacts.ran = True
+                if written is None:
+                    artifacts.notes.append(
+                        "index.md was written by hand (no hwiki marker); left alone")
+                else:
+                    artifacts.notes.append(
+                        f"regenerated index.md ({len(stale)} stale entr(ies))")
             else:
                 artifacts.skipped = "index writer unavailable"
         else:
@@ -535,6 +567,29 @@ def _pair_relation(a: str, b: str, embedder=None, toks_a=None, toks_b=None) -> s
     return ""
 
 
+def _wiki_for_artifacts(store, vault_root: Path, memory_rel: Path):
+    """The tick's ``store`` is the facts store; catalogs need the *vault* store.
+
+    ``lint_memory`` and ``write_index`` both want a WikiStore (root + memory_dir). Passing
+    the facts store made lint raise, the exception was swallowed, and the artifacts job
+    reported "catalogs current" on every tick — including on a vault whose index was
+    visibly stale.
+    """
+    if hasattr(store, "iter_pages") and hasattr(store, "memory_dir"):
+        return store
+    try:
+        from .store import WikiStore
+    except ImportError:  # pragma: no cover - loaded as a top-level module
+        try:
+            from store import WikiStore  # type: ignore
+        except ImportError:
+            return None
+    try:
+        return WikiStore(vault_root, memory_dir=str(memory_rel))
+    except Exception:
+        return None
+
+
 def _artifact_findings(store, vault_root: Path, memory_rel: Path) -> List[str]:
     findings: List[str] = []
     try:
@@ -544,13 +599,20 @@ def _artifact_findings(store, vault_root: Path, memory_rel: Path) -> List[str]:
             from lint import lint_memory  # type: ignore
         except ImportError:
             return findings
+    wiki = _wiki_for_artifacts(store, vault_root, memory_rel)
+    if wiki is None:
+        return findings
     try:
-        report = lint_memory(store)
+        report = lint_memory(wiki)
     except Exception:
         return findings
+    # Finding fields are (check, severity, page, detail) — reading ``code``/``subject``
+    # here matched nothing, so this job reported "catalogs current" forever and never
+    # regenerated a stale index. Ask the object for what it actually has.
     for finding in getattr(report, "findings", []):
-        if str(getattr(finding, "code", "")) in ("catalog.stale", "catalog.entry_missing"):
-            findings.append(f"{finding.code}: {finding.subject}")
+        check = str(getattr(finding, "check", ""))
+        if check in ("catalog.stale", "catalog.entry_missing"):
+            findings.append(f"{check}: {getattr(finding, 'page', '')}")
     return findings[:MAX_LISTED]
 
 

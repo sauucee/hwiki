@@ -141,6 +141,20 @@ token, whole blocks only — a block is either in or out, never cut mid-sentence
 least one block always survives. Priority: recalled facts, then gaps/conflicts/duplicates,
 then builtin memory, then wiki text. `0` disables the cap.
 
+### Maintenance safety (`hwiki maintain`)
+
+`maintain` is the bounded background tick: heal the index from the vault, sweep for
+conflicts and duplicates, flush recorded gaps, regenerate `index.md`/`log.md`. Three rules
+are enforced in code and covered by tests:
+
+* **`--dry-run` writes nothing.** Not the index, not the facts database, not open questions.
+  It reports what it *would* do ("would regenerate index.md (14 stale entr(ies))").
+* **A hand-written artifact is never overwritten.** `index.md`/`log.md` are only regenerated
+  when they carry `source: hwiki-catalog` in their frontmatter, i.e. when hwiki wrote them.
+  A file you wrote yourself is left alone and the tick says so. `write_index(force=True)` is
+  the explicit override.
+* **The tick never changes memory.** It does not accept, supersede, merge or delete a fact.
+
 ### Query-embedding cache (`embeddings.cache_size`)
 
 ```json

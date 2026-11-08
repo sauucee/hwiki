@@ -327,6 +327,13 @@ hard-excluded from search, not merely demoted — plus meta, and
 **never** accepts, supersedes, merges or deletes a fact. The review gate stays the
 only way memory changes meaning.
 
+Two guarantees, both enforced in code and covered by tests:
+
+* **`--dry-run` writes nothing** — not the index, not the facts database, not the question
+  buffer. It reports what it would do: *"would regenerate index.md (14 stale entr(ies))"*.
+* **A catalog you wrote by hand is never overwritten.** `index.md`/`log.md` are regenerated
+  only when they carry `source: hwiki-catalog` — i.e. when hwiki wrote them.
+
 ```bash
 hermes hwiki maintain             # when due (default: every 24 h)
 hermes hwiki maintain --dry-run   # report only, write nothing
