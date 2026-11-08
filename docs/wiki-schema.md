@@ -193,7 +193,28 @@ observation**: it never changes what `recall` returns.
 answerability were measured and failed; a real verdict needs a model. Callers that
 surface `confident` must surface `caveat` with it.
 
-## 11. Invariants this schema guarantees
+Available from the command line for a caller that wants to decide before speaking:
+
+```
+hermes hwiki confidence "where does staging run" [--json]
+```
+
+It prints `confident`, `best` vs `floor`, `margin`, `overlap`, the candidate count
+and the caveat. `--json` emits exactly the seven documented keys.
+
+## 11. Filing answers back
+
+`hermes hwiki file -q "<question>" [--from answer.md] [--tags a,b] [--json]`
+(answering on stdin otherwise) writes into `<memory_dir>/answers/`. It shares one
+implementation with the `wiki_memory_file` tool (`facts.file_answer`), so the page
+format cannot drift between the two entry points.
+
+Guarantees: secret-scanned and refused; idempotent per question; a slug collision
+between two *different* questions gives the newcomer a `-<digest>` sister file
+rather than overwriting; answers stay out of accepted-fact recall and out of the
+review queue.
+
+## 12. Invariants this schema guarantees
 
 1. The vault is authoritative; the SQLite index is disposable and rebuildable.
 2. `store.py` never writes outside `<root>/<memory_dir>`.

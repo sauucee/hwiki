@@ -1407,3 +1407,106 @@ class ProposalStore:
             "confident": bool(hits) and best >= floor and (margin >= 0.05 or len(hits) == 1),
             "caveat": "relatedness is not answerability",
         }
+
+
+# --------------------------------------------------------------------------
+# Filing a synthesised answer back into the wiki
+# --------------------------------------------------------------------------
+#
+# One implementation, two callers: the `wiki_memory_file` agent tool and
+# `hermes hwiki file`. Keeping the page format here means the CLI cannot drift
+# from the tool, and the tests only have to pin one behaviour.
+
+ANSWERS_SUBDIR = "answers"
+
+
+def file_answer(memory_root: Path, question: str, answer: str,
+                tags: Optional[Sequence[str]] = None, *,
+                today: Optional[str] = None) -> Dict[str, Any]:
+    """Write a synthesised answer into ``<memory_root>/answers/``.
+
+    Returns ``{success, path, created_page, duplicate, note}`` and never raises
+    for the expected cases (empty input, secret material, slug collision).
+    Idempotent: re-filing the same question returns the existing page rather than
+    overwriting it. Two *different* questions that slugify the same way each keep
+    their own file via a short digest suffix.
+    """
+    from .store import scan_for_secrets, slugify
+
+    question = " ".join(str(question or "").split())
+    answer = str(answer or "").strip()
+    if not question:
+        return {"success": False, "error": "question is required"}
+    if not answer:
+        return {"success": False, "error": "answer is required"}
+
+    found = scan_for_secrets(question + "\n" + answer)
+    if found:
+        return {
+            "success": False,
+            "error": (
+                "refusing to file an answer containing apparent secret material "
+                f"({', '.join(found)}); cite where the secret lives instead"
+            ),
+        }
+
+    tag_list = [str(t).strip() for t in (tags or []) if str(t).strip()]
+    answers_dir = Path(memory_root) / ANSWERS_SUBDIR
+    slug = slugify(question, fallback="answer")
+    target = answers_dir / f"{slug}.md"
+
+    def already_filed(path: Path) -> bool:
+        try:
+            previous = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        match = re.search(r"^# (.+)$", previous, re.M)
+        return bool(match) and match.group(1).strip().casefold() == question.casefold()
+
+    if target.exists():
+        if already_filed(target):
+            return {"success": True, "path": str(target), "created_page": False,
+                    "duplicate": True,
+                    "note": "This question is already filed; nothing was overwritten."}
+        digest = hashlib.sha1(question.encode("utf-8")).hexdigest()[:8]
+        target = answers_dir / f"{slug}-{digest}.md"
+        if target.exists():
+            return {"success": True, "path": str(target), "created_page": False,
+                    "duplicate": True,
+                    "note": "This question is already filed; nothing was overwritten."}
+
+    stamp = today or date.today().isoformat()
+    title = question[:160]
+    tag_line = ""
+    if tag_list:
+        tag_line = "\n" + " ".join(f"#{slugify(t)}" for t in tag_list) + "\n"
+    page_text = (
+        "---\n"
+        f"title: {title}\n"
+        "type: answer\n"
+        "status: filed\n"
+        "source: hwiki\n"
+        f"filed: {stamp}\n"
+        f"updated: {stamp}\n"
+        "---\n\n"
+        f"# {title}\n\n"
+        f"> **Filed:** {stamp} · from a conversation answer.\n\n"
+        f"{answer}\n"
+        f"{tag_line}"
+    )
+
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        answers_dir.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(page_text, encoding="utf-8")
+        tmp.replace(target)
+    except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return {"success": False, "error": f"could not file answer: {exc}"}
+
+    return {"success": True, "path": str(target), "created_page": True,
+            "duplicate": False,
+            "note": "Answer filed — searchable like any other page."}

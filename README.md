@@ -79,6 +79,7 @@ Browse them in Obsidian, or from the CLI:
 ```bash
 hermes hwiki catalog   # regenerate index.md
 hermes hwiki log       # show the last 10 events (--limit N)
+hermes hwiki file      # file a synthesised answer into Hermes/Memory/Auto/answers/
 ```
 
 `wiki_memory_status` reports both files under a `catalog` key, and log entries
@@ -253,6 +254,8 @@ hermes hwiki index               # force a full reindex
 hermes hwiki lint                # wiki links + memory-tree findings
 hermes hwiki lint --json         # same, machine-readable
 hermes hwiki plan --from notes.md  # read-only: what would happen to these claims?
+hermes hwiki file -q "Q" < ans.md   # file an answer back (same code as the tool)
+hermes hwiki confidence "query"  # is this hit set trustworthy? (--json)
 hermes hwiki config              # resolved configuration
 hermes hwiki migrate --dry-run   # import facts from the holographic provider
 ```

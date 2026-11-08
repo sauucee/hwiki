@@ -92,9 +92,9 @@ def _cmd_search(query: str, limit: int) -> None:
 def _facts_store(config):
     """Open the facts DB for a read-only command. Never creates a new one.
 
-    Planning reads the accepted-fact set to predict owners. If the DB does not
-    exist yet there is nothing to predict against, so we refuse instead of
-    letting ``ProposalStore`` create an empty schema as a side effect.
+    Planning and confidence both read the accepted-fact set. If the DB does not
+    exist yet there is nothing to read, so we refuse instead of letting
+    ``ProposalStore`` create an empty schema as a side effect.
     """
     from .facts import Embedder, ProposalStore
 
@@ -102,7 +102,7 @@ def _facts_store(config):
     db = home / "plugins-data" / "hwiki" / "facts.sqlite"
     if not db.is_file():
         print(f"\n  No facts database at {db}")
-        print("  Nothing accepted yet, so there is nothing to plan against.\n")
+        print("  Nothing has been accepted yet, so there are no facts to read.\n")
         return None, None
     mode = (config.get("embeddings") or {}).get("mode", "auto")
     return ProposalStore(str(db), embedder=Embedder(mode=mode)), "facts"
@@ -140,6 +140,70 @@ def _cmd_plan(source_file: str = "", as_json: bool = False) -> None:
     print("\nIngest plan (read-only)\n" + "-" * 46)
     print(format_plan(plan))
     print()
+
+
+def _cmd_file(question: str = "", answer_file: str = "", tags: str = "",
+              as_json: bool = False) -> None:
+    """File a synthesised answer into the wiki as a page (same code as the tool)."""
+    from .facts import file_answer
+
+    question = " ".join(str(question or "").split())
+    answer = ""
+    if answer_file:
+        path = Path(answer_file).expanduser()
+        if not path.is_file():
+            print(f"\n  No such file: {path}\n")
+            return
+        try:
+            answer = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"\n  Could not read {path}: {exc}\n")
+            return
+    else:
+        answer = "" if sys.stdin.isatty() else sys.stdin.read()
+
+    if not question or not answer.strip():
+        print("\n  Usage: hermes hwiki file --question 'Q' --from answer.md"
+              "\n         or pipe the answer on stdin.\n")
+        return
+
+    config, store, _backend = _load()
+    if store is None:
+        return
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    result = file_answer(store.memory_root(), question, answer, tag_list)
+    if as_json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+    if not result.get("success"):
+        print(f"\n  Refused: {result.get('error')}\n")
+        return
+    rel = store.relpath(Path(result["path"]))
+    if result.get("duplicate"):
+        print(f"\n  Already filed: {rel}\n  {result.get('note', '')}\n")
+        return
+    print(f"\n  Filed: {rel}\n  {result.get('note', '')}\n")
+
+
+def _cmd_confidence(query: str = "", as_json: bool = False) -> None:
+    """Show the recall confidence signal, so a caller can decide to abstain."""
+    config = load_config()
+    if not query.strip():
+        print("\n  Usage: hermes hwiki confidence <query>\n")
+        return
+    store, _backend = _facts_store(config)
+    if store is None:
+        return
+    conf = store.recall_confidence(query)
+    if as_json:
+        print(json.dumps(conf, indent=2, ensure_ascii=False))
+        return
+    print("\nRecall confidence\n" + "-" * 46)
+    print(f"  confident : {conf['confident']}")
+    print(f"  best      : {conf['best']:.3f}   floor {conf['floor']:.2f}")
+    print(f"  margin    : {conf['margin']:.3f}   overlap {conf['overlap']:.2f}")
+    print(f"  candidates: {conf['candidates']}")
+    print(f"\n  {conf['caveat']}\n")
 
 
 def _cmd_lint(as_json: bool = False, show_info: bool = False,
@@ -383,7 +447,15 @@ def wiki_command(args) -> None:
     elif sub == "plan":
         _cmd_plan(str(getattr(args, "plan_from", "") or ""),
                   bool(getattr(args, "plan_json", False)))
-    elif sub == "catalog":
+    elif sub == "file":
+        _cmd_file(str(getattr(args, "question", "") or ""),
+                  str(getattr(args, "answer_from", "") or ""),
+                  str(getattr(args, "tags", "") or ""),
+                  bool(getattr(args, "file_json", False)))
+    elif sub == "confidence":
+        _cmd_confidence(" ".join(getattr(args, "query", []) or []),
+                        bool(getattr(args, "confidence_json", False)))
+    elif sub in ("catalog", "index-md"):
         _cmd_catalog()
     elif sub == "log":
         _cmd_log(int(getattr(args, "limit", 10) or 10))
@@ -427,6 +499,22 @@ def register_cli(subparser) -> None:
                       help="File containing candidate source material")
     plan.add_argument("--json", action="store_true", dest="plan_json",
                       help="Machine-readable output")
+    fil = subs.add_parser(
+        "file", help="File a synthesised answer into the wiki as a page")
+    fil.add_argument("--question", "-q", default="",
+                     help="The question the answer responds to")
+    fil.add_argument("--from", dest="answer_from", default="",
+                     help="File holding the answer (default: stdin)")
+    fil.add_argument("--tags", default="", help="Comma-separated tags")
+    fil.add_argument("--json", action="store_true", dest="file_json",
+                     help="Machine-readable output")
+
+    conf = subs.add_parser(
+        "confidence", help="Show recall confidence (is this hit set trustworthy?)")
+    conf.add_argument("query", nargs="*", default=[],
+                      help="Search terms")
+    conf.add_argument("--json", action="store_true", dest="confidence_json",
+                     help="Machine-readable output")
     subs.add_parser("catalog", aliases=["index-md"],
                     help="Regenerate index.md (page catalog)")
     log = subs.add_parser("log", help="Show the last entries of log.md")

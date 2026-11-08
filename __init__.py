@@ -48,6 +48,7 @@ except Exception:  # pragma: no cover
 from .store import WikiStore, scan_for_secrets, slugify
 from .search import build_backend
 from .facts_provider import FactsEngine, FACT_TOOL_SCHEMAS, FACT_TOOLS_READ_ONLY
+from . import facts as facts_mod
 from .config import (
     CONFIG_FILENAME,
     DEFAULTS,
@@ -174,7 +175,7 @@ WIKI_WRITE_SCHEMA = {
     },
 }
 
-ANSWERS_SUBDIR = "answers"
+ANSWERS_SUBDIR = facts_mod.ANSWERS_SUBDIR
 
 WIKI_FILE_SCHEMA = {
     "name": "wiki_memory_file",
@@ -761,103 +762,27 @@ class WikiMemoryProvider(MemoryProvider):
                 f"wiki memory is read-only in agent_context='{self._agent_context}'. "
                 "Only the primary agent may file answers into the wiki."
             )
-        question = " ".join(str(args.get("question") or "").split())
-        answer = str(args.get("answer") or "").strip()
-        if not question:
-            return tool_error("question is required")
-        if not answer:
-            return tool_error("answer is required")
-
-        # Same guard as the write path: a filed answer is durable vault text.
-        found = scan_for_secrets(question + "\n" + answer)
-        if found:
-            return tool_error(
-                "refusing to file an answer containing apparent secret material "
-                f"({', '.join(found)}); cite where the secret lives instead"
-            )
-
         tags = args.get("tags") or []
         if isinstance(tags, str):
             tags = [t.strip() for t in tags.split(",") if t.strip()]
 
-        # Answers live in their own subfolder of the memory zone: inside the
-        # only tree this provider may write, but clear of accepted facts so
-        # they never enter fact recall or the review queue.
-        answers_dir = self._store.memory_root() / ANSWERS_SUBDIR
-        slug = slugify(question, fallback="answer")
-        target = answers_dir / f"{slug}.md"
-
-        if target.exists():
-            try:
-                previous = target.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                previous = ""
-            match = re.search(r"^# (.+)$", previous, re.M)
-            existing_question = match.group(1).strip() if match else ""
-            if existing_question.casefold() == question.casefold():
-                return json.dumps({
-                    "success": True,
-                    "path": self._store.relpath(target),
-                    "created_page": False,
-                    "duplicate": True,
-                    "note": "This question is already filed; nothing was overwritten.",
-                }, ensure_ascii=False)
-            # Slug collision between two different questions: never clobber
-            # the first answer, give the newcomer its own file.
-            digest = hashlib.sha1(question.encode("utf-8")).hexdigest()[:8]
-            target = answers_dir / f"{slug}-{digest}.md"
-            if target.exists():
-                return json.dumps({
-                    "success": True,
-                    "path": self._store.relpath(target),
-                    "created_page": False,
-                    "duplicate": True,
-                    "note": "This question is already filed; nothing was overwritten.",
-                }, ensure_ascii=False)
-
-        stamp = date.today().isoformat()
-        title = question[:160]
-        tag_line = ""
-        if tags:
-            tag_line = "\n" + " ".join(f"#{slugify(t)}" for t in tags if str(t).strip()) + "\n"
-        page_text = (
-            "---\n"
-            f"title: {title}\n"
-            "type: answer\n"
-            "status: filed\n"
-            "source: hwiki\n"
-            f"filed: {stamp}\n"
-            f"updated: {stamp}\n"
-            "---\n\n"
-            f"# {title}\n\n"
-            f"> **Filed:** {stamp} · from a conversation answer.\n\n"
-            f"{answer}\n"
-            f"{tag_line}"
+        # The filing itself lives in facts.file_answer: the CLI verb uses the
+        # same code, so the page format cannot drift between the two.
+        result = facts_mod.file_answer(
+            self._store.memory_root(),
+            args.get("question") or "",
+            args.get("answer") or "",
+            tags,
         )
-
-        tmp = target.with_name(target.name + ".tmp")
-        try:
-            answers_dir.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(page_text, encoding="utf-8")
-            tmp.replace(target)
-        except OSError as exc:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            return tool_error(f"could not file answer: {exc}")
-
-        self._writes_this_session += 1
-        self._maybe_reindex(force=True)
-        self._refresh_catalog(kind="file", subject=title[:120],
-                              detail="filed an answer")
-        return json.dumps({
-            "success": True,
-            "path": self._store.relpath(target),
-            "created_page": True,
-            "duplicate": False,
-            "note": "Answer filed — searchable like any other page.",
-        }, ensure_ascii=False)
+        if not result.get("success"):
+            return tool_error(str(result.get("error") or "could not file answer"))
+        if result.get("created_page"):
+            self._writes_this_session += 1
+            self._maybe_reindex(force=True)
+            self._refresh_catalog(kind="file", subject=str(result["path"])[:120],
+                                  detail="filed an answer")
+        result["path"] = self._store.relpath(Path(result["path"]))
+        return json.dumps(result, ensure_ascii=False)
 
     def _tool_status(self, args: Dict[str, Any]) -> str:
         self._maybe_reindex()
