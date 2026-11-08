@@ -25,6 +25,11 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+try:  # pragma: no cover - import style depends on how the module is loaded
+    from . import answerability as answerability_mod
+except ImportError:  # loaded as a top-level module
+    import answerability as answerability_mod
+
 
 # Value-shape detection: reject secret MATERIAL (assignments, real token
 # formats, key blobs), not discussion ABOUT secrets — so a rule like
@@ -748,10 +753,20 @@ class ProposalStore:
         "recall_count": "INTEGER DEFAULT 0",
     }
 
-    def __init__(self, database, embedder: Optional[Embedder] = None):
+    def __init__(self, database, embedder: Optional[Embedder] = None, *,
+                 answerability: Optional[bool] = None):
         self.database = Path(database)
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.embedder = embedder or Embedder()
+        # Opt-in, default OFF. Env var wins so the behavior suite can toggle the
+        # capability without editing a live config file.
+        if answerability is None:
+            env = os.environ.get("HWIKI_ANSWERABILITY", "").strip().lower()
+            if env in ("1", "true", "yes", "on"):
+                answerability = True
+            elif env in ("0", "false", "no", "off"):
+                answerability = False
+        self.answerability = bool(answerability)
         with _db_connection(self.database) as conn:
             conn.execute(
                 '''CREATE TABLE IF NOT EXISTS proposals (
@@ -1041,7 +1056,7 @@ class ProposalStore:
                 skipped += 1
                 continue
             with _db_connection(self.database) as conn:
-                conn.execute(
+                cur = conn.execute(
                     '''INSERT INTO proposals
                        (id, dedup_key, status, kind, claim, evidence, session_id, source_hash,
                         project, created_at, embedding, accepted_at, promoted, page_path, peer)
@@ -1053,7 +1068,13 @@ class ProposalStore:
                         accepted_at or time.time(), self.embedder.embed(claim),
                         accepted_at, 1, str(page), peer,
                     ))
-            imported += 1
+            # Count actual insertions, not attempts. Reporting every page as
+            # "imported" on a re-run made an idempotent rebuild look like it had
+            # duplicated work (and hid genuine conflicts from callers).
+            if cur.rowcount:
+                imported += 1
+            else:
+                skipped += 1
         # resolve lineage links between imported pages (second pass)
         for page in pages:
             try:
@@ -1233,7 +1254,8 @@ class ProposalStore:
                     kept_claims.append((row["id"], row["claim"]))
         return {"duplicates": removed, "expired": expired}
 
-    def recall(self, query, *, limit=8, status_filter="accepted", project=None, peer=None, now=None):
+    def recall(self, query, *, limit=8, status_filter="accepted", project=None, peer=None, now=None,
+               answerability=None):
         """Vector recall over stored facts (active ones by default).
 
         Scoring blends the embedding cosine with token-overlap jaccard (two
@@ -1316,6 +1338,11 @@ class ProposalStore:
             kept = [r for r in scored if r["score"] >= cutoff]
             kept.sort(key=lambda r: r["score"], reverse=True)
             kept = kept[:limit]
+        # Opt-in answer-type gate (OFF by default so the retrieval path that the
+        # Phase-0/1 baselines were measured on is byte-for-byte unchanged).
+        # Only ever removes hits, and only on a confident type mismatch.
+        if answerability if answerability is not None else self.answerability:
+            kept = answerability_mod.filter_hits(query, kept)
         # usage tracking: facts that actually get recalled get ranked higher later
         try:
             with _db_connection(self.database) as conn:

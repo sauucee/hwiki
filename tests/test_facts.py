@@ -293,9 +293,11 @@ class ProposalStoreTests(unittest.TestCase):
         self.assertEqual(stale['superseded_by'], p['id'])  # lineage resolved on second pass
         hits = fresh.recall('deploy target hosting')
         self.assertTrue(hits and all(h['id'] != p2['id'] for h in hits))
-        # idempotent
+        # idempotent: a re-run inserts nothing, so it must not report imports.
+        # (The counter used to count attempts and blamed 2 every time, which hid
+        # both true idempotency and real insert conflicts from callers.)
         again = fresh.rebuild_from_vault(vault, memory_rel)
-        self.assertEqual(again['imported'], 2)
+        self.assertEqual(again['imported'], 0)
         self.assertEqual(len(fresh.list_proposals(status='accepted')), 1)
 
     def test_forget_revokes_by_id_and_exact_claim(self):

@@ -36,7 +36,35 @@ Configuration lives in `$HERMES_HOME/hwiki.json` (`$HERMES_HOME` is `~/.hermes`,
 ### Environment overrides
 
 Environment variables win over the file: `HWIKI_PATH`, `HWIKI_BACKEND`,
-`HWIKI_MEMORY_DIR`, `HWIKI_QMD_BINARY`, `HWIKI_QMD_MODE`.
+`HWIKI_MEMORY_DIR`, `HWIKI_QMD_BINARY`, `HWIKI_QMD_MODE`, and
+`HWIKI_ANSWERABILITY`.
+
+### Answer-type gate (`HWIKI_ANSWERABILITY`, off by default)
+
+Recall answers *"is this fact related?"*. Sometimes the user asked *"is this fact
+the answer?"* — e.g. a question about a flight number scoring 0.78 against a fact
+about trip dates. `HWIKI_ANSWERABILITY=1` enables a narrow abstention gate over
+four answer types: **date**, **amount**, **identifier**, **quantity**.
+
+It abstains only when the question asks for one of those and the claim supplies a
+*different* one. It is conservative by design and only ever **removes** hits:
+
+- a question asking for no recognised type is never filtered;
+- a claim supplying no recognised type at all is never filtered (prose can still
+  be the answer);
+- a bare number does **not** count as an identifier — otherwise "May 2027" would
+  satisfy a flight-number question;
+- place and person are detected but never enforced, because a claim can name one
+  in passing and a false abstain deletes a correct answer.
+
+Measured effect on the frozen behavioural suite: onnx holdout 73% → 91%, dev
+unchanged at 100%, and the 40-case recall corpus unchanged at 38/40. It is a
+heuristic for one failure mode, **not** general answerability: verdicts, reasons
+and comparisons are untouched. See `benchmarks/phase2-answerability.md` in the
+project bundle for the measurements and the two rejected hypotheses.
+
+Also settable per-store (`ProposalStore(db, answerability=True)`) and per-call
+(`recall(query, answerability=True)`); an explicit argument beats the env var.
 
 ### Upgrading from the pre-1.0 `wiki` provider
 
