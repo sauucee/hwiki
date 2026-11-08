@@ -84,6 +84,17 @@ class CitationTests(unittest.TestCase):
                 self.assertTrue(hit["cite"].startswith("[["), hit["cite"])
                 self.assertNotIn("/", hit["cite"])
 
+    def test_citation_carries_a_stable_source_id(self):
+        """A citation needs an id that survives a rebuild, not just a page slug."""
+        pid, _page = self.accept("User prefers dark mode in every tool")
+        hit = self.store.recall("dark mode preference", limit=5)[0]
+        self.assertEqual(hit["id"], pid)
+        fresh = ProposalStore(Path(self.tmp.name) / "rebuilt.sqlite",
+                              embedder=Embedder(mode="hash"))
+        fresh.rebuild_from_vault(self.vault, MEMORY_REL)
+        again = fresh.recall("dark mode preference", limit=5)[0]
+        self.assertEqual(again["id"], pid, "the source id must survive a rebuild")
+
     def test_citation_still_names_the_superseded_page_in_lineage(self):
         old, old_page = self.accept("Staging server is moving to Hetzner VPS")
         new, _new_page = self.accept("Staging server stays on Fly.io")

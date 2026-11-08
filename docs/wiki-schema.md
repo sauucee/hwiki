@@ -113,9 +113,14 @@ lint says so (`catalog.entry_missing` / `catalog.stale`).
 Every recall hit carries:
 
 ```python
-{"page": "<page slug>", "cite": "[[<page slug>]]", "accepted": "YYYY-MM-DD",
+{"id": "1f0c…",                # stable source id = proposal_id
+ "page": "<page slug>", "cite": "[[<page slug>]]", "accepted": "YYYY-MM-DD",
  "claim": "...", "evidence": "...", "kind": "...", "peer": "...", "score": 0.71}
 ```
+
+`id` is the **stable approved source id**: it survives a rebuild because it is
+written into the page frontmatter as `proposal_id`. Cite it when a durable
+reference is needed; cite `[[page]]` when a human needs to click through.
 
 A caller that reports a fact **must** be able to name its page. Only the slug is
 exposed — never the absolute path, which may contain a home directory. A fact with
@@ -143,7 +148,6 @@ test pass, or hand-edit a page to change a fact without the change coming back
 through `sync_from_vault` (which re-validates and re-embeds).
 
 ## 8. Lint checks (v1)
-
 `hermes hwiki lint [--json] [--info]` — read-only, deterministic, never repairs.
 
 | check | severity | meaning |
@@ -161,7 +165,35 @@ through `sync_from_vault` (which re-validates and re-embeds).
 | `page.oversized` | info | page beyond 24 000 chars; consider splitting |
 | `answer.unreferenced` | info | filed answer no fact points at |
 
-## 9. Invariants this schema guarantees
+## 9. Ingest planning (read-only)
+
+`hermes hwiki plan --from <file>` (or stdin) answers "what *would* happen to these
+claims?" without doing it. For each candidate it predicts one of
+`near_duplicate`, `conflict`, `merge_into_owner`, `new_page`, or
+`refused_secret`, naming the owning page and the score where relevant.
+
+**It writes nothing.** No proposal rows, no pages, no catalog, no log, and the
+facts database is not modified — asserted by test, not by inspection. If the facts
+database does not exist the command refuses rather than creating one as a side
+effect.
+
+It is **not an extractor**: candidate claims are split naively on sentence and
+bullet boundaries without a model. A caller with a real extractor should pass the
+claims it already has. A plan is a prediction, not a promise — the review gate can
+still reject, and a human can reword.
+
+## 10. Recall confidence (advisory, not a verdict)
+
+`store.recall_confidence(query)` returns `best`, `margin`, `overlap`,
+`candidates`, `floor`, `confident`, and a fixed `caveat`. It is a **pure
+observation**: it never changes what `recall` returns.
+
+`confident` means only "this retrieval is not empty and not ambiguous". It does
+**not** mean the fact answers the question. Two deterministic attempts to derive
+answerability were measured and failed; a real verdict needs a model. Callers that
+surface `confident` must surface `caveat` with it.
+
+## 11. Invariants this schema guarantees
 
 1. The vault is authoritative; the SQLite index is disposable and rebuildable.
 2. `store.py` never writes outside `<root>/<memory_dir>`.

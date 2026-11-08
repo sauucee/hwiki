@@ -1359,3 +1359,43 @@ class ProposalStore:
         except Exception:
             pass
         return kept
+
+    def recall_confidence(self, query, *, limit=8, **kwargs) -> dict:
+        """Advisory confidence in the top hit. Never changes ranking.
+
+        Retrieval answers "is this related?". It does not know whether the fact
+        answers the question: two deterministic attempts to derive answerability
+        were measured and failed (see benchmarks/phase2-answerability.md). Rather
+        than fake a verdict, this returns the raw signals a caller can judge, so an
+        agent with more context can decide to abstain.
+
+        Returned keys:
+          ``best``      top blended score (0 when nothing was found)
+          ``margin``    best minus runner-up; small means an ambiguous field
+          ``overlap``   lexical jaccard of the top hit (0 when nothing found)
+          ``candidates`` how many facts were within the relevance cutoff
+          ``floor``     the noise floor the tier applies
+          ``confident`` best >= floor and (no runner-up or margin >= 0.05)
+          ``caveat``    fixed string: relatedness is not answerability
+
+        Callers must not treat ``confident`` as "this answers the question".
+        """
+        hits = self.recall(query, limit=limit, **kwargs)
+        floor = float(getattr(self.embedder, "noise_floor", 0.0))
+        best = float(hits[0]["score"]) if hits else 0.0
+        second = float(hits[1]["score"]) if len(hits) > 1 else 0.0
+        query_toks = set(_tokens(query))
+        overlap = 0.0
+        if hits:
+            claim_toks = set(_tokens(str(hits[0]["claim"])))
+            overlap = len(query_toks & claim_toks) / max(1, len(query_toks | claim_toks))
+        margin = round(best - second, 3)
+        return {
+            "best": round(best, 3),
+            "margin": margin,
+            "overlap": round(overlap, 3),
+            "candidates": len(hits),
+            "floor": round(floor, 3),
+            "confident": bool(hits) and best >= floor and (margin >= 0.05 or len(hits) == 1),
+            "caveat": "relatedness is not answerability",
+        }

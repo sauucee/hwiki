@@ -89,6 +89,59 @@ def _cmd_search(query: str, limit: int) -> None:
         print(f"     {hit.snippet[:220]}\n")
 
 
+def _facts_store(config):
+    """Open the facts DB for a read-only command. Never creates a new one.
+
+    Planning reads the accepted-fact set to predict owners. If the DB does not
+    exist yet there is nothing to predict against, so we refuse instead of
+    letting ``ProposalStore`` create an empty schema as a side effect.
+    """
+    from .facts import Embedder, ProposalStore
+
+    home = Path(str(config.get("_hermes_home") or ""))
+    db = home / "plugins-data" / "hwiki" / "facts.sqlite"
+    if not db.is_file():
+        print(f"\n  No facts database at {db}")
+        print("  Nothing accepted yet, so there is nothing to plan against.\n")
+        return None, None
+    mode = (config.get("embeddings") or {}).get("mode", "auto")
+    return ProposalStore(str(db), embedder=Embedder(mode=mode)), "facts"
+
+
+def _cmd_plan(source_file: str = "", as_json: bool = False) -> None:
+    """Read-only: predict what would happen to supplied claims. Writes nothing."""
+    from .plan import build_plan, candidate_claims, format_plan
+
+    config = load_config()
+    text = ""
+    if source_file:
+        path = Path(source_file).expanduser()
+        if not path.is_file():
+            print(f"\n  No such file: {path}\n")
+            return
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"\n  Could not read {path}: {exc}\n")
+            return
+    else:
+        text = sys.stdin.read() if not sys.stdin.isatty() else ""
+    if not text.strip():
+        print("\n  Usage: hermes hwiki plan --from <file>   (or pipe text on stdin)\n")
+        return
+
+    store, _backend = _facts_store(config)
+    if store is None:
+        return
+    plan = build_plan(store, candidate_claims(text), source=source_file or "stdin")
+    if as_json:
+        print(json.dumps(plan.to_dict(), indent=2, ensure_ascii=False))
+        return
+    print("\nIngest plan (read-only)\n" + "-" * 46)
+    print(format_plan(plan))
+    print()
+
+
 def _cmd_lint(as_json: bool = False, show_info: bool = False) -> None:
     config, store, backend = _load()
     if store is None:
@@ -316,6 +369,9 @@ def wiki_command(args) -> None:
     elif sub == "lint":
         _cmd_lint(bool(getattr(args, "lint_json", False)),
                   bool(getattr(args, "lint_info", False)))
+    elif sub == "plan":
+        _cmd_plan(str(getattr(args, "plan_from", "") or ""),
+                  bool(getattr(args, "plan_json", False)))
     elif sub == "catalog":
         _cmd_catalog()
     elif sub == "log":
@@ -335,7 +391,7 @@ def wiki_command(args) -> None:
         )
     else:
         print("\n  Usage: hermes hwiki "
-              "<status|index|search|lint|catalog|log|migrate|config>\n")
+              "<status|index|search|lint|plan|catalog|log|migrate|config>\n")
 
 
 def register_cli(subparser) -> None:
@@ -350,6 +406,13 @@ def register_cli(subparser) -> None:
                       help="Machine-readable output")
     lint.add_argument("--info", action="store_true", dest="lint_info",
                       help="Include informational notes")
+
+    plan = subs.add_parser(
+        "plan", help="Read-only: preview what would happen to supplied claims")
+    plan.add_argument("--from", dest="plan_from", default="",
+                      help="File containing candidate source material")
+    plan.add_argument("--json", action="store_true", dest="plan_json",
+                      help="Machine-readable output")
     subs.add_parser("catalog", aliases=["index-md"],
                     help="Regenerate index.md (page catalog)")
     log = subs.add_parser("log", help="Show the last entries of log.md")

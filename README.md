@@ -252,6 +252,7 @@ hermes hwiki search "release process"
 hermes hwiki index               # force a full reindex
 hermes hwiki lint                # wiki links + memory-tree findings
 hermes hwiki lint --json         # same, machine-readable
+hermes hwiki plan --from notes.md  # read-only: what would happen to these claims?
 hermes hwiki config              # resolved configuration
 hermes hwiki migrate --dry-run   # import facts from the holographic provider
 ```
@@ -259,6 +260,17 @@ hermes hwiki migrate --dry-run   # import facts from the holographic provider
 `lint` is read-only and never repairs. It reports provenance that cannot be read
 as **unknown** rather than guessing a value, and it checks hand-written notes in
 the memory zone for secret material even though it skips their schema.
+
+`plan` is also read-only — it writes no proposal rows, no pages and no catalog,
+and refuses rather than creating a missing database. It reports a predicted action
+per claim (`near_duplicate`, `conflict`, `merge_into_owner`, `new_page`,
+`refused_secret`). It is **not an extractor**: candidate claims are split naively
+without a model, so pass pre-extracted claims if you have them.
+
+`recall_confidence(query)` is a pure observation on top of recall: `best`,
+`margin`, `overlap`, `floor` and a `confident` flag that means "not empty and not
+ambiguous" — **not** "this answers the question". The `caveat` field says so and
+must travel with the number.
 
 ## Configuration
 
