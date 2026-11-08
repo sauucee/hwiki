@@ -197,7 +197,7 @@ def main() -> int:
         print("\n[7] written facts are recalled")
         recalled = provider.prefetch("what does the user prefer for answer style")
         check("prefetch recalls new fact", "concise" in recalled, repr(recalled)[:200])
-        check("prefetch is labelled", recalled.startswith("## Wiki Memory"), recalled[:40])
+        check("prefetch is labelled", recalled.startswith("## Memory (recalled)"), recalled[:40])
 
         print("\n[8] prefetch latency budget (manager hard-timeout is 8s)")
         timings = []

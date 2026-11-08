@@ -45,6 +45,7 @@ except Exception:  # pragma: no cover
 
 from .store import WikiStore, scan_for_secrets, slugify
 from .search import build_backend
+from .facts_provider import FactsEngine, FACT_TOOL_SCHEMAS, FACT_TOOLS_READ_ONLY
 from .config import (
     CONFIG_FILENAME,
     DEFAULTS,
@@ -204,6 +205,7 @@ class WikiMemoryProvider(MemoryProvider):
         self._init_error = ""
         self._agent_context = "primary"
         self._read_only = False
+        self._facts: Optional[FactsEngine] = None
 
     # -- identity ----------------------------------------------------------
 
@@ -289,6 +291,19 @@ class WikiMemoryProvider(MemoryProvider):
             self._init_error = f"initial index failed: {exc}"
             logger.warning("wiki memory: %s", self._init_error)
 
+        # review-gated fact write path (merged from hwiki-extractor, v2.0)
+        try:
+            self._facts = FactsEngine(
+                self._hermes_home, root,
+                Path(str(self._config.get("memory_dir") or "wiki/memory")),
+                config=dict(self._config.get("facts") or {}))
+            self._facts.read_only = self._read_only
+            self._facts.store()  # opens + migrates + heals from the vault
+            logger.info("wiki memory: fact store ready (read_only=%s)", self._read_only)
+        except Exception as exc:
+            logger.warning("wiki memory: fact store unavailable: %s", exc)
+            self._facts = None
+
     def shutdown(self) -> None:
         with self._lock:
             backend = self._backend
@@ -304,6 +319,9 @@ class WikiMemoryProvider(MemoryProvider):
         if kwargs.get("reset"):
             self._writes_this_session = 0
         self._pending.pop(new_session_id, None)
+        if self._facts is not None:
+            with self._facts._state_lock:
+                self._facts._session_state.pop(new_session_id, None)
 
     # The remaining ABC hooks are deliberate no-ops. They are declared
     # explicitly (rather than inherited) so the plugin behaves identically
@@ -313,11 +331,19 @@ class WikiMemoryProvider(MemoryProvider):
         """No per-turn bookkeeping needed — recall is index-driven."""
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """No end-of-session extraction.
+        """End-of-session structural tidy (no transcript ingestion).
 
         Auto-summarising a transcript into the wiki would degrade it into a
-        chat log. Durable facts are filed deliberately via wiki_memory_write.
+        chat log. The tidy pass merges duplicate pending proposals, expires
+        stale ones, promotes accepted-but-unsaved facts, and refreshes the
+        fact-graph canvas. Diary + summary come from the plugin-level
+        on_session_finalize hook, which owns the session state.
         """
+        if self._facts is not None and self._facts.read_only is False:
+            try:
+                self._facts.session_tidy(self._session_id, write_diary=False)
+            except Exception as exc:
+                logger.debug("wiki memory: session tidy failed: %s", exc)
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Contribute nothing to the compression summary."""
@@ -368,7 +394,7 @@ class WikiMemoryProvider(MemoryProvider):
         except Exception:
             counts = {"pages": 0, "chunks": 0}
         memory_dir = self._store.memory_dir
-        return (
+        block = (
             "# Wiki Memory\n"
             f"Long-term memory is a markdown wiki at `{self._store.root}` "
             f"({counts.get('pages', 0)} pages indexed, backend={self._backend.name}).\n"
@@ -376,8 +402,20 @@ class WikiMemoryProvider(MemoryProvider):
             "- `wiki_memory_read` — open a page in full and follow its [[wikilinks]].\n"
             "- `wiki_memory_write` — file durable facts (preferences, decisions, "
             "stable environment facts). Never secrets or task progress.\n"
+            "- `memory_propose` — propose a durable fact for user review; accepted facts "
+            "become notes in the memory zone.\n"
+            "- `memory_recall` — search approved facts + the vault in one call.\n"
             f"Automatic writes land in `{memory_dir}/`; curated pages are edited by hand only."
         )
+        if self._facts is not None:
+            profile = self._facts.profile_block(
+                max_chars=int((self._config.get("facts") or {}).get(
+                    "injection", {}).get("max_chars", 3500)),
+                max_facts=int((self._config.get("facts") or {}).get(
+                    "injection", {}).get("max_facts", 25)))
+            if profile:
+                block += "\n\n" + profile
+        return block
 
     # -- recall ------------------------------------------------------------
 
@@ -385,9 +423,35 @@ class WikiMemoryProvider(MemoryProvider):
         if not self._config.get("auto_recall", True):
             return ""
         cached = self._pending.pop(session_id or self._session_id, "")
-        if cached:
-            return cached
-        return self._recall(query)
+        wiki_part = cached or self._recall(query)
+        return self._fuse_recall(query, wiki_part)
+
+    def _fuse_recall(self, query: str, wiki_part: str) -> str:
+        """Per-turn dynamic injection: approved facts + builtin lines + wiki."""
+        parts: List[str] = []
+        if self._facts is not None:
+            try:
+                fact_hits = self._facts.recall_facts(query, limit=6)
+                if fact_hits:
+                    neighbors = {}
+                    for hit in fact_hits[:3]:
+                        found = self._facts.store().neighbors([hit["id"]], limit=2)
+                        if found:
+                            neighbors[hit["id"]] = found
+                    block = self._facts._format_fact_recall(fact_hits, neighbors=neighbors)
+                    if block:
+                        parts.append(block)
+                builtin_lines = self._facts.builtin_recall_lines(query, self._facts.store().embedder)
+                if builtin_lines:
+                    parts.append("**From Hermes builtin memory (read-only):**\n"
+                                 + "\n".join(builtin_lines))
+            except Exception as exc:
+                logger.debug("wiki memory: fact recall fusion failed: %s", exc)
+        if wiki_part:
+            parts.append(wiki_part)
+        if not parts:
+            return ""
+        return "## Memory (recalled)\n\n" + "\n\n".join(parts)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Warm the next turn's recall in the background."""
@@ -398,7 +462,7 @@ class WikiMemoryProvider(MemoryProvider):
         def _run() -> None:
             try:
                 self._maybe_reindex()
-                result = self._recall(query)
+                result = self._fuse_recall(query, self._recall(query))
                 if result:
                     self._pending[key] = result
             except Exception as exc:
@@ -490,6 +554,12 @@ class WikiMemoryProvider(MemoryProvider):
             # Don't advertise a tool we will refuse — a cron/subagent run
             # shouldn't waste turns discovering the write path is closed.
             schemas = [s for s in schemas if s is not WIKI_WRITE_SCHEMA]
+        if self._facts is not None:
+            for fact_schema in self._facts.tool_schemas(self._read_only):
+                full = {"name": fact_schema["name"],
+                        "description": fact_schema["description"],
+                        "parameters": fact_schema["parameters"]}
+                schemas.append(full)
         return schemas
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -506,6 +576,13 @@ class WikiMemoryProvider(MemoryProvider):
                 return self._tool_write(args)
             if tool_name == "wiki_memory_status":
                 return self._tool_status(args)
+            if self._facts is not None and tool_name.startswith("memory_"):
+                result = self._facts.handle_tool_call(
+                    tool_name, args, tool_error,
+                    user_text=str(args.get("_user_text") or ""),
+                    session_id=self._session_id)
+                if result is not None:
+                    return result
         except KeyError as exc:
             return tool_error(f"missing required argument: {exc}")
         except ValueError as exc:
@@ -650,4 +727,51 @@ class WikiMemoryProvider(MemoryProvider):
 
 def register(ctx) -> None:
     """Called by the Hermes memory plugin discovery system."""
-    ctx.register_memory_provider(WikiMemoryProvider(config=load_config()))
+    provider = WikiMemoryProvider(config=load_config())
+    ctx.register_memory_provider(provider)
+
+    # plugin-level lifecycle hooks for the fact write path (extraction needs
+    # the per-turn side-question window; providers alone don't get one)
+    def _wire_hooks():
+        if provider._facts is None:
+            return
+        ctx.register_hook("post_llm_call", provider._facts.hook_handler(ctx))
+
+        def _on_session_start(**kwargs):
+            provider._facts.sync_from_vault()
+
+        def _on_session_finalize(**kwargs):
+            if not provider._facts.read_only:
+                try:
+                    provider._facts.session_tidy(
+                        str(kwargs.get("session_id") or ""), write_diary=True)
+                except Exception as exc:
+                    logger.debug("wiki memory: finalize tidy failed: %s", exc)
+
+        ctx.register_hook("on_session_start", _on_session_start)
+        ctx.register_hook("on_session_finalize", _on_session_finalize)
+        logger.info("wiki memory: fact extraction hooks registered")
+
+    # provider.initialize() runs during agent init; hooks can be registered
+    # immediately — the engine lazy-initializes its store on first use
+    provider._facts = _maybe_build_facts(provider)
+    _wire_hooks()
+
+
+def _maybe_build_facts(provider: "WikiMemoryProvider") -> Optional[FactsEngine]:
+    """Build the facts engine early (for hook registration); paths come from
+    config, availability errors are deferred to initialize()."""
+    try:
+        raw_path = _expand(str(provider._config.get("wiki_path") or ""),
+                           provider._hermes_home)
+        if not raw_path:
+            return None
+        engine = FactsEngine(
+            provider._hermes_home, Path(raw_path),
+            Path(str(provider._config.get("memory_dir") or "wiki/memory")),
+            config=dict(provider._config.get("facts") or {}))
+        engine.store()  # opens + migrates + heals
+        return engine
+    except Exception as exc:
+        logger.warning("wiki memory: fact store unavailable at registration: %s", exc)
+        return None

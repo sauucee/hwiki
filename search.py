@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
 import threading
+from datetime import datetime
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -79,6 +81,10 @@ _STOPWORDS = {
     "was", "were", "be", "do", "does", "did", "what", "which", "who", "how",
     "why", "when", "where", "our", "we", "you", "i", "it", "this", "that",
     "with", "about", "from", "have", "has", "can", "should", "would", "please",
+    # personal pronouns/possessives: "what does the user prefer" must not
+    # turn "user" into a query token that matches every memory page's title
+    "user", "users", "my", "mine", "your", "yours", "their", "theirs",
+    "me", "he", "she", "his", "hers", "am",
 }
 
 
@@ -225,11 +231,19 @@ class Fts5Backend:
 
     # -- query -------------------------------------------------------------
 
+    # Recency multiplier: fresh pages win ties, stale pages never win on
+    # freshness alone. 1.0 + 0.25 * exp(-age_days / 45) — a page updated today
+    # scores 1.25x its bm25, one updated 3+ months ago ~1.0x.
+    RECENCY_BOOST = 0.25
+    RECENCY_HALFLIFE_DAYS = 45.0
+
     def search(self, query: str, *, limit: int = 6, spine: str = "") -> List[SearchHit]:
         match = build_match_query(query)
         if not match:
             return []
         conn = self._connect()
+        # fetch a small over-pool so the recency rerank has candidates to order
+        pool = max(int(limit) * 3, 12)
         sql = (
             "SELECT path, title, heading, "
             "  snippet(chunks, 3, '', '', ' … ', 24) AS snip, "
@@ -241,25 +255,59 @@ class Fts5Backend:
             sql += "AND spine = ? "
             params.append(spine)
         sql += "ORDER BY rank LIMIT ?"
-        params.append(int(limit))
+        params.append(pool)
         try:
             rows = conn.execute(sql, params).fetchall()
         except sqlite3.OperationalError as exc:
             logger.debug("FTS5 query failed (%s) for %r", exc, match)
             return []
 
+        # pages.updated (frontmatter date) drives the recency multiplier; fall
+        # back to the indexed mtime when a page carries no date.
+        meta = {
+            row["path"]: (row["updated"], row["mtime"])
+            for row in conn.execute(
+                "SELECT path, updated, mtime FROM pages WHERE path IN "
+                f"({','.join('?' for _ in rows)})",
+                [r["path"] for r in rows],
+            ).fetchall()
+        } if rows else {}
+
+        def _age_days(path: str) -> float:
+            updated, mtime = meta.get(path, (None, None))
+            stamp = None
+            for value in (updated, mtime):
+                if not value:
+                    continue
+                try:
+                    if isinstance(value, str):
+                        stamp = datetime.fromisoformat(value.strip()[:10]).timestamp()
+                    else:
+                        stamp = float(value)
+                    break
+                except (ValueError, TypeError, OSError):
+                    continue
+            if stamp is None:
+                return None
+            return max(0.0, (time.time() - stamp) / 86400.0)
+
         hits: List[SearchHit] = []
         for row in rows:
             # bm25() is negative-better; map to a positive relevance score.
+            score = max(0.0, -float(row["rank"]))
+            age = _age_days(row["path"])
+            if age is not None:
+                score *= 1.0 + self.RECENCY_BOOST * math.exp(-age / self.RECENCY_HALFLIFE_DAYS)
             hits.append(SearchHit(
                 path=row["path"],
                 title=row["title"] or "",
                 heading=row["heading"] or "",
                 snippet=" ".join((row["snip"] or "").split()),
-                score=max(0.0, -float(row["rank"])),
+                score=score,
                 backend=self.name,
             ))
-        return hits
+        hits.sort(key=lambda h: h.score, reverse=True)
+        return hits[: int(limit)]
 
     def close(self) -> None:
         with self._lock:

@@ -1,9 +1,11 @@
 name: hwiki
-version: 1.0.0
-description: "Markdown wiki as Hermes long-term memory: plain files you and the agent edit together (Obsidian-compatible, git-versionable), local SQLite FTS5 search, optional qmd hybrid retrieval. No network."
+version: 2.0.0
+description: "Combined memory provider: Obsidian-markdown wiki (git-versionable, human-editable) + review-gated fact extraction with local semantic recall, dynamic per-turn injection, contradiction flagging, learning and self-healing. Zero external services."
 author: Otto Sulin
 license: MIT
 homepage: https://github.com/ottosulin/hwiki
+capabilities:
+  - llm.side_question
 manifest_version: 2
 requires_hermes: ">=0.21"
 
@@ -17,7 +19,10 @@ external_dependencies:
     check: "qmd --version"
     install: "npm install -g @tobilu/qmd   # requires Node.js >= 22"
 
-# Memory-provider tools are served through MemoryProvider.get_tool_schemas(), not
-# ctx.register_tool(), so no plugin-level tools or hooks are declared here.
+# All tools (wiki + facts) are served through MemoryProvider.get_tool_schemas();
+# the plugin-level hooks below drive the fact extraction/review write path.
 provides_tools: []
-provides_hooks: []
+provides_hooks:
+  - post_llm_call
+  - on_session_start
+  - on_session_finalize

@@ -13,6 +13,55 @@ standard library and a local SQLite FTS5 index.
 
 You think querying the markdown memory is slow? The provider answers in milliseconds.
 
+## v2.0 — combined memory provider (wiki + review-gated facts)
+
+hwiki now owns the full memory loop. The standalone `hwiki-extractor` plugin
+merged into this provider (v2.0):
+
+- **Write path (review-gated)**: per-turn extraction proposes durable facts
+  (`memory_propose`); only user-accepted facts become one Obsidian note each
+  in the memory zone. `memory_supersede` / `memory_forget` / `memory_accept`
+  manage the lifecycle; every change lands in the audit log and regenerates
+  the fact-graph Canvas.
+- **Dynamic per-turn injection**: `prefetch` fuses approved-fact recall
+  (local ONNX MiniLM vectors, gracefully degrading to hashed n-grams),
+  builtin-memory lines, and wiki recall into one bounded block — every turn,
+  not just session start.
+- **Learns from you**: accept/reject decisions feed back into extraction
+  prompts per fact kind; usage counters rank facts that actually get used;
+  never-used old facts resurface as "still true?" review candidates.
+- **Self-healing + hand-editable**: the vault is the source of truth — edits
+  sync back, deletions revoke, and a lost fact database rebuilds from pages.
+- **Builtin-memory compliant**: never writes Hermes MEMORY.md/USER.md;
+  cross-checks for duplicates; recall can search them read-only.
+
+Config (all optional) lives under a `"facts"` key in `hwiki.json`:
+
+```json
+{
+  "facts": {
+    "injection": {"enabled": true, "max_chars": 3500, "max_facts": 25},
+    "review": {"cadence_turns": 5, "decay_days": 90, "proposal_ttl_days": 14},
+    "diary": {"enabled": true},
+    "embeddings": {"mode": "auto"}
+  }
+}
+```
+
+The optional ONNX embedding tier (~25 MB, one-time, fully offline afterwards)
+is set up by `hwiki-extractor`'s `tests/setup_embeddings.sh` recipe or any
+equivalent; without it recall degrades to word-matching, never failing.
+
+## Recall quality (1.1.0)
+
+- **Stopword hygiene**: personal pronouns/possessives ("user", "my", "their"…) are
+  stripped from queries — "what does the user prefer" now compiles to `"prefer"*`
+  instead of matching every memory page's title.
+- **Recency-aware ranking**: `pages.updated` (frontmatter date, falling back to
+  indexed mtime) applies a gentle multiplier — `1.0 + 0.25·e^(−age_days/45)` — so
+  freshly updated pages win ties while old pages are demoted, never hidden.
+- Ranking regressions live in `tests/test_ranking.py`.
+
 ## Why hwiki
 
 | Typical agent memory | hwiki |
