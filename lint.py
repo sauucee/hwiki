@@ -292,3 +292,67 @@ def to_dict(report: LintReport) -> dict:
             for f in report.sorted_findings()
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# semantic suggestions (opt-in, advisory only)
+# ---------------------------------------------------------------------------
+
+# The roadmap is explicit: semantic lint "may suggest candidates only; it must
+# never silently declare or resolve contradictions". So this pass never writes,
+# never changes a status, and never says "these contradict" — it says "these are
+# close enough that a human should look". Two thresholds control it:
+#
+#   SUGGEST_MIN  — below this the facts are merely in the same topic
+#   SUGGEST_MAX  — above this they are handled by the duplicate/near-dup gate on
+#                  the write path already, so reporting them here is noise
+SUGGEST_MIN = 0.62
+SUGGEST_MAX = 0.90
+
+
+def suggest_review_pairs(store, *, min_score: float = SUGGEST_MIN,
+                         max_score: float = SUGGEST_MAX,
+                         limit: int = 25) -> LintReport:
+    """Pairs of accepted facts close enough to deserve a human look.
+
+    Read-only and advisory. Findings are always ``info`` severity: nothing here
+    can make a vault fail lint, because similarity is not evidence of a problem.
+    """
+    from .facts import _tokens
+
+    report = LintReport()
+    rows = [r for r in store.list_proposals(status="accepted", limit=10000)
+            if r.get("claim") and r.get("embedding")]
+    report.pages_checked = len(rows)
+    if len(rows) < 2:
+        return report
+
+    from .facts import _cosine_batch
+    vectors = [r["embedding"] for r in rows]
+    token_sets = [set(_tokens(str(r["claim"]))) for r in rows]
+    pairs = []
+    for i in range(len(rows)):
+        cosines = _cosine_batch(vectors[i], vectors[i + 1:])
+        for offset, cos in enumerate(cosines, start=1):
+            j = i + offset
+            overlap = len(token_sets[i] & token_sets[j]) / max(
+                1, len(token_sets[i] | token_sets[j]))
+            score = max(cos, 0.5 * cos + 0.5 * overlap)
+            if min_score <= score < max_score:
+                pairs.append((score, i, j))
+    pairs.sort(key=lambda p: p[0], reverse=True)
+
+    for score, i, j in pairs[:limit]:
+        page = _claim_page(rows[i]) or _claim_page(rows[j]) or "facts"
+        report.add("semantic.review_pair", INFO, page,
+                   f"{rows[i]['claim'][:60]!r} ~ {rows[j]['claim'][:60]!r} "
+                   f"(similarity {score:.2f}; compare, do not auto-resolve)")
+    return report
+
+
+def _claim_page(row: dict) -> str:
+    page = row.get("page_path") or ""
+    if not page:
+        return ""
+    from pathlib import Path as _Path
+    return f"{_Path(str(page)).parent.name}/{_Path(str(page)).name}"

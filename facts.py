@@ -310,6 +310,14 @@ def related_and_conflict(claim, others, embedder,
     for rel in related[:3]:
         # negation pairs legitimately score below 0.5 in embedding space —
         # check every related entry, flagging is cheap and user-reviewed
+        #
+        # Slot-value contradictions ("runs on Fly.io" vs "runs on Hetzner") are
+        # NOT detected here, on purpose. A token-divergence heuristic was built and
+        # measured (see benchmarks/phase4-floor-shape.md): it flagged "runs on
+        # Fly.io" against "runs Postgres", because both are value-shaped tokens and
+        # only the predicate says which slot they fill. Telling those apart needs
+        # semantics, so the flag stays negation-only and review still shows
+        # `related` for a human to judge.
         if _negation_signal(rel["text"]) != claim_negated:
             conflict = True
             break

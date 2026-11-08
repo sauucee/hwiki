@@ -187,3 +187,102 @@ class LintTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class SemanticSuggestionTests(unittest.TestCase):
+    """The semantic pass may only *suggest*. It is advisory, read-only, and it
+    must never declare a contradiction or resolve one.
+
+    The 0.62-0.90 band is exercised by stubbing the scorer: the hashed tier has no
+    semantic blur (near-identical claims score ~1.0, related ones ~0.15-0.23), so a
+    real hash-tier pair never lands in the band. That is a property of the tier, not
+    of the pass — see test_hash_tier_yields_no_suggestions.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "vault"
+        self.mem = self.root / MEMORY_REL
+        self.mem.mkdir(parents=True)
+        self.store = WikiStore(root=self.root, memory_dir=MEMORY_REL.as_posix())
+        self.facts = ProposalStore(self.root / "facts.sqlite",
+                                   embedder=Embedder(mode="hash"))
+        for claim in ("Staging server stays on Fly.io",
+                      "Every deploy needs a green CI run",
+                      "The user prefers terse status updates"):
+            p = self.facts.propose({"kind": "environment", "claim": claim,
+                                    "evidence": "stated"}, user_text="stated",
+                                   session_id="s")
+            self.facts.accept(p["id"])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _stub_scores(self, matrix):
+        """Patch the pairwise scorer so chosen similarity values are used."""
+        import hwiki.facts as facts_mod
+        rows = list(matrix)
+
+        def fake(_vec, others):
+            # The last row has an empty comparison slice; still gets called.
+            if not others:
+                return []
+            return (rows.pop(0) if rows else [])[:len(others)]
+
+        original = facts_mod._cosine_batch
+        facts_mod._cosine_batch = fake
+        self.addCleanup(setattr, facts_mod, "_cosine_batch", original)
+
+    def test_pair_inside_the_band_is_suggested(self):
+        from hwiki.lint import suggest_review_pairs
+        # rows[0] -> similarity to facts 1 and 2 ; rows[1] -> similarity to fact 2
+        self._stub_scores([[0.75, 0.10], [0.05]])
+        report = suggest_review_pairs(self.facts)
+        self.assertEqual([f.check for f in report.findings], ["semantic.review_pair"])
+
+    def test_near_duplicates_above_the_band_are_left_to_the_write_path(self):
+        from hwiki.lint import suggest_review_pairs
+        self._stub_scores([[0.95, 0.10], [0.05]])
+        self.assertEqual(suggest_review_pairs(self.facts).findings, [])
+
+    def test_unrelated_pairs_below_the_band_are_ignored(self):
+        from hwiki.lint import suggest_review_pairs
+        self._stub_scores([[0.20, 0.10], [0.05]])
+        self.assertEqual(suggest_review_pairs(self.facts).findings, [])
+
+    def test_suggestions_are_never_errors(self):
+        from hwiki.lint import suggest_review_pairs, INFO
+        self._stub_scores([[0.75, 0.10], [0.05]])
+        report = suggest_review_pairs(self.facts)
+        self.assertTrue(all(f.severity == INFO for f in report.findings))
+        self.assertTrue(report.ok, "similarity must never fail lint")
+
+    def test_suggestion_says_compare_not_resolve(self):
+        from hwiki.lint import suggest_review_pairs
+        self._stub_scores([[0.75, 0.10], [0.05]])
+        for finding in suggest_review_pairs(self.facts).findings:
+            self.assertIn("do not auto-resolve", finding.detail)
+
+    def test_semantic_pass_writes_nothing(self):
+        from hwiki.lint import suggest_review_pairs
+        self._stub_scores([[0.75, 0.10], [0.05]])
+        db = self.root / "facts.sqlite"
+        before = db.read_bytes()
+        suggest_review_pairs(self.facts)
+        self.assertEqual(db.read_bytes(), before,
+                         "a suggestion pass must not write, not even a status change")
+
+    def test_hash_tier_yields_no_suggestions(self):
+        """Documented tier limit: no mid-band pairs exist without semantic blur."""
+        from hwiki.lint import suggest_review_pairs
+        self.assertEqual(suggest_review_pairs(self.facts).findings, [])
+
+    def test_single_fact_is_not_suggested(self):
+        from hwiki.lint import suggest_review_pairs
+        alone = ProposalStore(self.root / "alone.sqlite",
+                              embedder=Embedder(mode="hash"))
+        p = alone.propose({"kind": "fact", "claim": "Only one fact here",
+                           "evidence": "stated"}, user_text="stated",
+                          session_id="s")
+        alone.accept(p["id"])
+        self.assertEqual(suggest_review_pairs(alone).findings, [])

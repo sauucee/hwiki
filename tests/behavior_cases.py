@@ -66,6 +66,12 @@ class Case:
     expect: Expect
     project: str = ""
     peer: str = ""
+    # A documented, measured miss. It is NOT a free pass: it still counts as a
+    # failure, so the accuracy rate stays honest and the regression floor still
+    # guards it. The label exists so a run says KNOWN instead of MISS (this is not
+    # new rot) and FIXED once it starts passing (so the annotation gets removed
+    # rather than quietly rotting into a lie). Empty = not a known miss.
+    known_miss: str = ""
 
 
 @dataclass
@@ -234,7 +240,15 @@ TEAM_OPS = Story(
              Expect(needs_any=["sev1"])),
         Case("runbooks", "paraphrase",
              "where are the operational procedures kept",
-             Expect(needs_any=["runbook"])),
+             Expect(needs_any=["runbook"]),
+             # Measured, documented miss: the claim "Runbooks live in the ops vault
+             # folder" scores 0.246 against a 0.26 noise floor, so it never reaches
+             # the ranking. It is a synonym gap ("operational procedures" vs
+             # "runbooks"), not an answerability case. The guard refusals sit at
+             # 0.219-0.220, so any floor that admits this would also admit them —
+             # lowering it is suite-fitting, not a fix. See
+             # benchmarks/phase4-floor-shape.md.
+             known_miss="onnx: synonym gap, top 0.246 vs floor 0.26"),
         Case("overview", "broad",
              "summarise the ops process",
              Expect(min_distinct=3)),

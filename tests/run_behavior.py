@@ -149,6 +149,7 @@ def run_story(story, embedder, root: Path):
             "story": story.id, "set": story.set, "case": case.id,
             "category": case.category, "query": case.query,
             "passed": result.passed, "reason": result.reason,
+            "known_miss": case.known_miss,
             "hits": [{"claim": h["claim"][:110], "replaced": h.get("replaced", ""),
                       "score": h.get("score")} for h in hits[:5]],
         })
@@ -240,7 +241,13 @@ def main() -> int:
             print(f"  {cat:<12} {hits}/{len(cases)}")
             for c in cases:
                 if not c["passed"]:
-                    print(f"    MISS {c['case']}: {c['reason']}")
+                    tag = "KNOWN" if c.get("known_miss") else "MISS"
+                    print(f"    {tag} {c['case']}: {c['reason']}"
+                          + (f" [{c['known_miss']}]" if c.get("known_miss") else ""))
+                elif c.get("known_miss"):
+                    # Improved past a documented miss: drop the annotation.
+                    print(f"    FIXED {c['case']}: now passes — remove its "
+                          f"known_miss annotation")
 
     if skipped:
         print(f"\nSKIPPED (not counted as pass): {', '.join(sorted(skipped))}")

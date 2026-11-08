@@ -142,13 +142,23 @@ def _cmd_plan(source_file: str = "", as_json: bool = False) -> None:
     print()
 
 
-def _cmd_lint(as_json: bool = False, show_info: bool = False) -> None:
+def _cmd_lint(as_json: bool = False, show_info: bool = False,
+              semantic: bool = False) -> None:
     config, store, backend = _load()
     if store is None:
         return
-    from .lint import format_report, lint_memory, to_dict
+    from .lint import format_report, lint_memory, suggest_review_pairs, to_dict
 
     report = lint_memory(store)
+    if semantic:
+        # Advisory only: info-severity suggestions, never a verdict, never a write.
+        facts, _ = _facts_store(config)
+        if facts is not None:
+            try:
+                suggestions = suggest_review_pairs(facts)
+                report.findings.extend(suggestions.findings)
+            except Exception as exc:  # noqa: BLE001 - never break lint on a suggestion pass
+                print(f"  (semantic pass unavailable: {type(exc).__name__}: {exc})")
     if as_json:
         print(json.dumps(to_dict(report), indent=2, ensure_ascii=False))
         return
@@ -368,7 +378,8 @@ def wiki_command(args) -> None:
         _cmd_search(" ".join(getattr(args, "query", []) or []), int(getattr(args, "limit", 6) or 6))
     elif sub == "lint":
         _cmd_lint(bool(getattr(args, "lint_json", False)),
-                  bool(getattr(args, "lint_info", False)))
+                  bool(getattr(args, "lint_info", False)),
+                  bool(getattr(args, "lint_semantic", False)))
     elif sub == "plan":
         _cmd_plan(str(getattr(args, "plan_from", "") or ""),
                   bool(getattr(args, "plan_json", False)))
@@ -406,6 +417,9 @@ def register_cli(subparser) -> None:
                       help="Machine-readable output")
     lint.add_argument("--info", action="store_true", dest="lint_info",
                       help="Include informational notes")
+    lint.add_argument("--semantic", action="store_true", dest="lint_semantic",
+                      help="Also suggest fact pairs that deserve a human look "
+                           "(advisory; never resolves contradictions)")
 
     plan = subs.add_parser(
         "plan", help="Read-only: preview what would happen to supplied claims")
