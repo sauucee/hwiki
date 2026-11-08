@@ -238,16 +238,27 @@ hits from saved raw materials.
 | `wiki_memory_file` | File a synthesised answer as a reusable page (`answers/`) |
 | `wiki_memory_status` | Index stats; with `lint`, dangling links and orphan pages |
 
+The fact layer (`facts.py`) additionally stamps every recall hit with a citation:
+`page` (the vault page slug) and `cite` (`[[<slug>]]`), plus `accepted` (the date
+the fact was approved). Only the slug is exposed — never the absolute path. See
+[docs/wiki-schema.md](docs/wiki-schema.md) for the full agent-facing contract:
+source trust, approval states, provenance fields, citations, and lint severity.
+
 ## CLI
 
 ```bash
 hermes hwiki status              # root, backend, counts
 hermes hwiki search "release process"
 hermes hwiki index               # force a full reindex
-hermes hwiki lint                # dangling wikilinks, orphan pages
+hermes hwiki lint                # wiki links + memory-tree findings
+hermes hwiki lint --json         # same, machine-readable
 hermes hwiki config              # resolved configuration
 hermes hwiki migrate --dry-run   # import facts from the holographic provider
 ```
+
+`lint` is read-only and never repairs. It reports provenance that cannot be read
+as **unknown** rather than guessing a value, and it checks hand-written notes in
+the memory zone for secret material even though it skips their schema.
 
 ## Configuration
 

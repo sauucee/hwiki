@@ -1277,7 +1277,7 @@ class ProposalStore:
                 window_days = days or int(match.group(1))
                 break
         now = now if now is not None else time.time()
-        sql = ("SELECT id, kind, claim, evidence, project, accepted_at, supersedes, peer, embedding "
+        sql = ("SELECT id, kind, claim, evidence, project, accepted_at, supersedes, peer, embedding, page_path "
                "FROM proposals WHERE status=? AND (superseded_by IS NULL OR superseded_by='') "
                "AND embedding IS NOT NULL")
         params: list = [status_filter]
@@ -1310,6 +1310,7 @@ class ProposalStore:
                 if window_days is not None and days > window_days:
                     outside_window.append(row["id"])  # demote at ranking, never hide
             if score > 0.0 or broad_intent:
+                page_stem = Path(row["page_path"]).stem if row["page_path"] else ""
                 scored.append({
                     "id": row["id"], "kind": row["kind"], "claim": row["claim"],
                     "evidence": (row["evidence"] or "")[:140],
@@ -1317,6 +1318,12 @@ class ProposalStore:
                     "peer": row["peer"] or "user",
                     "accepted": _iso_date(row["accepted_at"]),
                     "replaced": lineage.get(row["supersedes"], ""),
+                    # Citation surface: a wikilink back to the vault page a caller
+                    # can cite, plus the accepted date. Only the slug is exposed —
+                    # never the absolute filesystem path, which may contain a
+                    # home directory. Empty when the fact has no page yet.
+                    "page": page_stem,
+                    "cite": (f"[[{page_stem}]]" if page_stem else ""),
                     "score": round(score, 3), "source": "fact",
                 })
         if not scored:

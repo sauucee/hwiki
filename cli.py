@@ -89,15 +89,23 @@ def _cmd_search(query: str, limit: int) -> None:
         print(f"     {hit.snippet[:220]}\n")
 
 
-def _cmd_lint() -> None:
+def _cmd_lint(as_json: bool = False, show_info: bool = False) -> None:
     config, store, backend = _load()
     if store is None:
+        return
+    from .lint import format_report, lint_memory, to_dict
+
+    report = lint_memory(store)
+    if as_json:
+        print(json.dumps(to_dict(report), indent=2, ensure_ascii=False))
         return
     dangling = store.dangling_links()
     _out, backlinks = store.link_graph()
     orphans = [p.slug for p in store.iter_pages()
                if not backlinks.get(p.slug) and p.slug != "index"]
+    counts = report.counts()
     print("\nWiki lint\n" + "-" * 46)
+    print(f"  Memory pages checked: {report.pages_checked}")
     if dangling:
         print(f"  Dangling wikilinks ({sum(len(v) for v in dangling.values())}):")
         for source, targets in sorted(dangling.items()):
@@ -105,6 +113,15 @@ def _cmd_lint() -> None:
     else:
         print("  Dangling wikilinks: none")
     print(f"  Orphan pages ({len(orphans)}): {', '.join(sorted(orphans)[:20]) or 'none'}")
+    print(f"  Memory findings: {counts['error']} error(s), "
+          f"{counts['warn']} warning(s), {counts['info']} note(s)")
+    body = format_report(report, show_info=show_info)
+    if body:
+        print()
+        for line in body.splitlines():
+            print(f"  {line}")
+    elif counts["info"]:
+        print("  (notes hidden; pass --info to show them)")
     print()
 
 
@@ -297,7 +314,8 @@ def wiki_command(args) -> None:
     elif sub == "search":
         _cmd_search(" ".join(getattr(args, "query", []) or []), int(getattr(args, "limit", 6) or 6))
     elif sub == "lint":
-        _cmd_lint()
+        _cmd_lint(bool(getattr(args, "lint_json", False)),
+                  bool(getattr(args, "lint_info", False)))
     elif sub == "catalog":
         _cmd_catalog()
     elif sub == "log":
@@ -326,7 +344,12 @@ def register_cli(subparser) -> None:
 
     subs.add_parser("status", help="Show wiki root, backend and index counts")
     subs.add_parser("index", help="Force a full reindex")
-    subs.add_parser("lint", help="Report dangling wikilinks and orphan pages")
+    lint = subs.add_parser(
+        "lint", help="Report dangling wikilinks, orphans and memory-tree findings")
+    lint.add_argument("--json", action="store_true", dest="lint_json",
+                      help="Machine-readable output")
+    lint.add_argument("--info", action="store_true", dest="lint_info",
+                      help="Include informational notes")
     subs.add_parser("catalog", aliases=["index-md"],
                     help="Regenerate index.md (page catalog)")
     log = subs.add_parser("log", help="Show the last entries of log.md")
@@ -347,12 +370,13 @@ def register_cli(subparser) -> None:
     subparser.set_defaults(func=wiki_command)
 
 
-if __name__ == "__main__":  # manual invocation: python3 -m wiki.cli status
-    class _Args:
-        wiki_command = sys.argv[1] if len(sys.argv) > 1 else "status"
-        query = sys.argv[2:]
-        limit = 6
-        db = ""
-        page = "imported"
-        dry_run = "--dry-run" in sys.argv
-    wiki_command(_Args())
+if __name__ == "__main__":  # manual invocation: python3 -m hwiki.cli lint --json
+    # Parse through the real argparse tree. A hand-rolled namespace here used to
+    # silently drop every flag (`--json`, `--dry-run`), so the shim disagreed with
+    # `hermes hwiki ...` — the worst kind of bug to debug.
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python3 -m hwiki.cli")
+    register_cli(parser)
+    argv = sys.argv[1:] or ["status"]  # keep the old no-arg default
+    wiki_command(parser.parse_args(argv))
