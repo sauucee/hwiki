@@ -294,6 +294,11 @@ hermes hwiki maintain --force     # ignore the interval
 hermes hwiki maintain --json      # machine-readable
 ```
 
+Recorded questions are not just written down: when the current query is about one
+of them, the prefetch block says so explicitly — *"Memory gaps this looks like (ask,
+do not assume)"*. Memory that knows what it does not know can ask, instead of
+improvising an answer.
+
 The turn hook runs a tick when the interval has elapsed and flushes unanswered
 questions every turn, so they survive a restart. Both are isolated: a failing tick
 never costs the conversation its extraction. `maintenance.interval_hours = 0` turns

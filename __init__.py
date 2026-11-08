@@ -557,6 +557,9 @@ class WikiMemoryProvider(MemoryProvider):
                 if builtin_lines:
                     parts.append("**From Hermes builtin memory (read-only):**\n"
                                  + "\n".join(builtin_lines))
+                gap = self._open_question_hint(query)
+                if gap:
+                    parts.append(gap)
             except Exception as exc:
                 logger.debug("wiki memory: fact recall fusion failed: %s", exc)
         if wiki_part:
@@ -581,6 +584,62 @@ class WikiMemoryProvider(MemoryProvider):
                 logger.debug("wiki memory: queue_prefetch failed: %s", exc)
 
         threading.Thread(target=_run, daemon=True, name="wiki-memory-prefetch").start()
+
+    def _open_question_hint(self, query: str) -> str:
+        """Raise an unanswered question this conversation is about.
+
+        Maintenance records what recall could not answer. Until now nothing ever
+        surfaced those, so the memory knew it was missing something and said nothing.
+        Here a relevant gap is offered as a question to ask, never as a fact to assert:
+        the agent should ask the user, not guess.
+        """
+        try:
+            import json as _json
+            from . import maintain as maintain_mod
+        except ImportError:  # pragma: no cover - loaded as a top-level module
+            try:
+                import json as _json
+                import maintain as maintain_mod  # type: ignore
+            except ImportError:
+                return ""
+        try:
+            questions = _json.loads(
+                self._facts.store().get_meta(maintain_mod.META_OPEN_QUESTIONS) or "[]")
+        except Exception:
+            return ""
+        if not questions:
+            return ""
+        # facts_mod._tokens, not a bare _tokens: this module never imported the
+        # helper, and a broad `except Exception` around it turned that NameError into
+        # a silently empty hint. A bug here must be visible, not swallowed.
+        try:
+            tokenise = facts_mod._tokens
+        except AttributeError:
+            logger.debug("wiki memory: token helper unavailable; no gap hint")
+            return ""
+        query_tokens = set(tokenise(query))
+        if not query_tokens:
+            return ""
+        scored = []
+        for question in questions:
+            if not isinstance(question, str):
+                continue
+            question_tokens = set(tokenise(question))
+            shared = query_tokens & question_tokens
+            if not shared:
+                continue
+            # Containment, not jaccard: the query is short and a stored question is
+            # long, so jaccard would punish an exact topical match ("what is the
+            # escalation policy?" against a question that names SEV1 as well).
+            score = len(shared) / max(1, min(len(query_tokens), len(question_tokens)))
+            if score >= 0.6:
+                scored.append((score, question))
+        if not scored:
+            return ""
+        scored.sort(reverse=True)
+        lines = [f"- {question[:160]}" for _score, question in scored[:2]]
+        return ("**Memory gaps this looks like (ask, do not assume):**\n"
+                + "\n".join(lines))
 
     def _recall(self, query: str) -> str:
         if self._backend is None:

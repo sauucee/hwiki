@@ -267,6 +267,10 @@ Its authority is deliberately narrow:
   what it skipped.
 * Unanswered questions are buffered **in memory** during recall (so recall stays a
   pure read) and flushed to meta on the next turn.
+* A recorded question whose vocabulary contains the current query is surfaced in the
+  prefetch block as *"Memory gaps this looks like (ask, do not assume)"*. It is
+  presented as a question to ask, never as a fact to assert — surfacing a gap must not
+  become inventing an answer.
 
 ## 14. Invariants this schema guarantees
 

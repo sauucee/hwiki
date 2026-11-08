@@ -286,6 +286,67 @@ class EngineHookTests(_Vault):
         self.assertIn("what is the escalation policy for SEV1?", stored)
 
 
+class GapHintTests(unittest.TestCase):
+    """The recorded questions must actually reach the agent, or the job is theatre."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.wiki = root / "vault"
+        (self.wiki / "Hermes" / "Memory" / "Auto").mkdir(parents=True)
+        (self.wiki / "concepts").mkdir()
+        (self.wiki / "concepts" / "seed.md").write_text("# Seed\n", encoding="utf-8")
+        self.home = root / "home"
+        self.home.mkdir()
+        self.provider = self._provider()
+
+    def tearDown(self):
+        try:
+            self.provider.shutdown()
+        except Exception:
+            pass
+        self.tmp.cleanup()
+
+    def _provider(self):
+        from hwiki import WikiMemoryProvider
+
+        provider = WikiMemoryProvider(config={
+            "wiki_path": str(self.wiki), "memory_dir": "Hermes/Memory/Auto",
+            "index_path": str(self.home / "index.sqlite"), "reindex_interval_s": 0,
+            "_hermes_home": str(self.home), "embeddings": {"mode": "hash"},
+            "facts": {"compile_enabled": False},
+        })
+        provider.initialize("s1", hermes_home=str(self.home), platform="cli")
+        return provider
+
+    def _record(self, questions):
+        self.provider._facts.store().set_meta(maintain.META_OPEN_QUESTIONS,
+                                              json.dumps(questions))
+
+    def test_a_relevant_gap_is_raised_for_the_agent(self):
+        self._record(["what is the escalation policy for SEV1 incidents?"])
+        block = self.provider.prefetch("what is the escalation policy?")
+        self.assertIn("escalation policy", block)
+        self.assertIn("ask, do not assume", block)
+
+    def test_an_unrelated_gap_stays_quiet(self):
+        self._record(["what is the escalation policy for SEV1 incidents?"])
+        self.assertEqual(self.provider.prefetch("what editor does the user prefer"), "")
+
+    def test_it_is_a_question_not_an_assertion(self):
+        self._record(["what is the user's favourite food?"])
+        block = self.provider.prefetch("what is the user's favourite food?")
+        self.assertIn("?", block)
+        self.assertNotIn("Memory (recalled)\n\n- ", block)
+
+    def test_no_gaps_means_no_block(self):
+        self.assertEqual(self.provider.prefetch("what is the escalation policy?"), "")
+
+    def test_a_corrupt_meta_value_does_not_break_prefetch(self):
+        self.provider._facts.store().set_meta(maintain.META_OPEN_QUESTIONS, "{not json")
+        self.assertEqual(self.provider.prefetch("what is the escalation policy?"), "")
+
+
 class RenderTests(_Vault):
     def test_page_carries_the_required_frontmatter(self):
         report = self.tick()
