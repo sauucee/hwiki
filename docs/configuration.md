@@ -37,7 +37,7 @@ Configuration lives in `$HERMES_HOME/hwiki.json` (`$HERMES_HOME` is `~/.hermes`,
 
 Environment variables win over the file: `HWIKI_PATH`, `HWIKI_BACKEND`,
 `HWIKI_MEMORY_DIR`, `HWIKI_QMD_BINARY`, `HWIKI_QMD_MODE`,
-`HWIKI_ANSWERABILITY`, `HWIKI_NLI_CONFLICT`, and `HWIKI_NLI_DIR`.
+`HWIKI_ANSWERABILITY`, `HWIKI_NLI_CONFLICT`, `HWIKI_NLI_DUP`, and `HWIKI_NLI_DIR`.
 
 ### Answer-type gate (`HWIKI_ANSWERABILITY`, off by default)
 
@@ -84,6 +84,24 @@ It also cannot answer the original question — "does this fact *answer* this
 question?" — because a question is not a hypothesis: entailment(question, claim)
 measured 0.000 median for correct answers and 0.000 for refusals. That formulation
 is rejected and recorded so it is not retried.
+
+### Paraphrase duplicates (`HWIKI_NLI_DUP`, off by default)
+
+Similarity alone misses paraphrases: "User prefers terse status updates" against
+"… short status updates" blends to 0.887, just under the 0.90 duplicate bar.
+`HWIKI_NLI_DUP=1` asks the model, and treats the pair as the same fact when **each
+claim entails the other**.
+
+Mutual entailment matters. One-directional entailment is not paraphrase — a specific
+claim entails a general one ("Staging is on Fly.io in the EU region" entails "Staging
+is on Fly.io" at 0.979) and merging that would silently drop the detail. Measured:
+one-directional produced one wrong merge in four; mutual entailment produced none.
+
+    paraphrases deduplicated     default 1/4   HWIKI_NLI_DUP=1  2/4
+    wrong merges                 0/4                         0/4
+
+The model is only consulted for candidates in the 0.75–0.90 similarity band, and not
+at all when similarity has already decided.
 
 No network at runtime; the model is on disk. If the bundle is missing every entry
 point raises `NliUnavailable` and callers keep the previous behaviour. See

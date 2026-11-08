@@ -233,6 +233,9 @@ the default path is byte-for-byte unchanged.
 * Measured: 7/7 genuine contradictions found where the token rules find 1/7, at the
 cost of 3/14 compatible pairs wrongly read as contradictory. Both numbers travel
 with the feature.
+* `HWIKI_NLI_DUP=1` additionally treats a **mutually** entailing pair as the same fact.
+One-directional entailment is a refinement, not a duplicate, and merging it drops
+detail (measured: 1 wrong merge in 4 before requiring both directions, 0 after).
 * It cannot answer "does this fact answer this question?" — a question is not a
 hypothesis, and entailment(question, claim) measured zero signal. Do not rebuild that.
 

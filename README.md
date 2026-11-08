@@ -258,6 +258,11 @@ contradictions; the model finds 7 of 7 but reads 3 of 14 compatible pairs as
 contradictory. `restatement` is the practical win — it catches paraphrases that
 similarity missed (`terse`/`short` at 0.997 entailment).
 
+`HWIKI_NLI_DUP=1` goes further and treats a **mutually** entailing pair as the same
+fact — paraphrases similarity misses (default 1/4 deduplicated, 2/4 with the tier,
+no wrong merges either way). One-way entailment is not a duplicate: a specific claim
+entails a general one, and merging that drops the detail.
+
 Off by default (165 MB RSS), no network at runtime, and a missing bundle raises
 `NliUnavailable` rather than guessing. See
 [docs/configuration.md](docs/configuration.md) and the measurements in the project

@@ -16,7 +16,21 @@ contradictions, ending at 4/7 recall — worse than the model alone. Real value 
 So the model's own label is reported as-is, with the probabilities, and the measured
 error rate travels with it:
 
-    recall 7/7 genuine contradictions, 3/14 compatible pairs wrongly flagged
+    contradiction: recall 7/7, 3/14 compatible pairs wrongly flagged
+
+A second measured correction is in `restatement`. One-directional entailment is not
+paraphrase: a *specific* claim entails a general one ("Staging is on Fly.io in the EU
+region" entails "Staging is on Fly.io" at 0.979), and treating that as a duplicate
+silently drops the detail — measured as one wrong merge out of four. So a restatement
+requires **mutual** entailment in both directions:
+
+                    forward   reverse   mutual   verdict
+    refinement       0.979     0.001     0.001   not a duplicate  (correct)
+    terse / short    0.993     0.997     0.993   duplicate
+    restic reorder   0.998     0.998     0.998   duplicate
+
+That keeps 2 of 4 paraphrases with zero wrong merges, against 1 of 4 for similarity
+alone.
 
 That is why the result is an advisory annotation for a reviewer and never the
 `possible_conflict` flag: negation keeps that flag at high precision, and the model
@@ -42,6 +56,7 @@ except ImportError:  # loaded as a top-level module
 logger = logging.getLogger(__name__)
 
 ENV_ENABLE = "HWIKI_NLI_CONFLICT"
+ENV_DUP = "HWIKI_NLI_DUP"
 MIN_CONTRADICTION = 0.90
 MIN_ENTAILMENT = 0.90
 
@@ -55,8 +70,18 @@ user users they them their our your my
 """.split())
 
 
+def _truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def enabled() -> bool:
-    return os.environ.get(ENV_ENABLE, "").strip().lower() in {"1", "true", "yes", "on"}
+    """Annotate candidates with the relation the model reads."""
+    return _truthy(ENV_ENABLE)
+
+
+def dup_enabled() -> bool:
+    """Treat a paraphrase as a duplicate. Changes what gets stored, so separate."""
+    return _truthy(ENV_DUP)
 
 
 def content_tokens(text: str) -> set:
@@ -83,19 +108,34 @@ def classify_pair(a: str, b: str, scorer: Optional[NliScorer] = None) -> Dict[st
         raise NliUnavailable("no NLI model available")
     contradiction, entailment, neutral = active.probabilities(a, b)
     overlap = frame_overlap(a, b)
+    reverse = None
     if contradiction >= MIN_CONTRADICTION:
         relation = "contradiction"
     elif entailment >= MIN_ENTAILMENT:
-        relation = "restatement"
+        # Mutual entailment, not one-way: a specific claim entails a general one and
+        # that is a refinement, not a duplicate. Measured above.
+        reverse = active.probabilities(b, a)[1]
+        relation = "restatement" if reverse >= MIN_ENTAILMENT else "compatible"
     else:
         relation = "compatible"
-    return {
+    result = {
         "relation": relation,
         "contradiction": round(contradiction, 3),
         "entailment": round(entailment, 3),
         "neutral": round(neutral, 3),
         "frame_overlap": round(overlap, 3),
     }
+    if reverse is not None:
+        result["entailment_reverse"] = round(reverse, 3)
+    return result
+
+
+def is_paraphrase(a: str, b: str, scorer: Optional[NliScorer] = None) -> bool:
+    """True only when each claim entails the other — the paraphrase test."""
+    try:
+        return classify_pair(a, b, scorer)["relation"] == "restatement"
+    except NliUnavailable:
+        return False
 
 
 def flags_contradiction(a: str, b: str, scorer: Optional[NliScorer] = None) -> bool:

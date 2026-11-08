@@ -39,12 +39,25 @@ except ImportError:
         verdict_mod = None
 
 
+_NLI_DUP_MIN_SCORE = 0.75
+
+
 def _nli_conflict_enabled() -> bool:
     """Opt-in only: importing/loading the model is not free."""
     if verdict_mod is None:
         return False
     try:
         return verdict_mod.enabled()
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _nli_dup_enabled() -> bool:
+    """Paraphrase-as-duplicate, opt-in separately: it changes what gets stored."""
+    if verdict_mod is None:
+        return False
+    try:
+        return verdict_mod.dup_enabled()
     except Exception:  # pragma: no cover - defensive
         return False
 
@@ -324,6 +337,7 @@ def related_and_conflict(claim, others, embedder,
             related.append({"key": key, "score": round(blended, 3), "text": text})
     related.sort(key=lambda r: r["score"], reverse=True)
     conflict = False
+    confirmed_dup = None
     claim_negated = _negation_signal(claim)
     for rel in related[:3]:
         # negation pairs legitimately score below 0.5 in embedding space —
@@ -340,30 +354,50 @@ def related_and_conflict(claim, others, embedder,
             conflict = True
             break
 
-    # Optional second opinion from the local NLI model. Off by default, because
-    # loading it costs ~0.2 s and 165 MB of RSS on a path that must stay cheap.
-    # It never changes `conflict`: measured on a labelled 21-pair set, the model
+    # Optional second opinion from the local NLI model. Off by default: loading it
+    # costs ~165 MB of RSS on a path that must stay cheap, and the default retrieval
+    # behaviour must not move. Two independent opt-ins share one model load:
+    #
+    #   HWIKI_NLI_CONFLICT=1  annotate candidates with the relation the model reads
+    #   HWIKI_NLI_DUP=1       treat a paraphrase as a duplicate (see below)
+    #
+    # Neither can change `conflict`: measured on a labelled 21-pair set the model
     # finds 7/7 genuine contradictions against the negation rule's 1/7, but also
-    # calls 3 compatible pairs contradictory (see benchmarks/phase4-nli-verdict.md).
-    # So it annotates each candidate with a `relation` for the reviewer and is
-    # reported separately as `tension` — a flag to read, not a verdict to act on.
-    tension = False
-    if related and _nli_conflict_enabled():
+    # reads 3/14 compatible pairs as contradictory (benchmarks/phase4-nli-verdict.md).
+    # So it annotates for the reviewer instead of deciding.
+    if related and (_nli_conflict_enabled() or _nli_dup_enabled()):
         try:
             scorer = verdict_mod.try_get_scorer()
         except Exception:  # pragma: no cover - defensive
             scorer = None
         if scorer is not None:
+            annotate = _nli_conflict_enabled()
             for rel in related[:3]:
+                # Similarity already decided (>= 0.90) or the candidate is too
+                # distant to be a paraphrase: asking the model cannot change
+                # anything, so do not pay for it.
+                if not annotate and (best_dup_key is not None
+                                     or rel["score"] < _NLI_DUP_MIN_SCORE):
+                    continue
                 try:
-                    relation = verdict_mod.classify_pair(claim, rel["text"], scorer)
+                    read = verdict_mod.classify_pair(claim, rel["text"], scorer)
                 except Exception:  # pragma: no cover - model hiccup
                     break
-                rel["relation"] = relation["relation"]
-                rel["nli"] = {"contradiction": relation["contradiction"],
-                              "entailment": relation["entailment"]}
-                if relation["relation"] == "contradiction":
-                    tension = True
+                if annotate:
+                    rel["relation"] = read["relation"]
+                    rel["nli"] = {"contradiction": read["contradiction"],
+                                  "entailment": read["entailment"]}
+                # A paraphrase the similarity threshold just missed: "terse status
+                # updates" vs "short status updates" scores 0.887 blended, under the
+                # 0.90 bar, but reads 0.997 entailment. Only taken when no stronger
+                # duplicate exists, and never when it contradicts (same rule as above).
+                if (best_dup_key is None and confirmed_dup is None
+                        and read["relation"] == "restatement"
+                        and not conflict):
+                    best_dup_key, best_dup_score = rel["key"], rel["score"]
+                    confirmed_dup = rel["text"]
+                    if not annotate:
+                        break
     return related, conflict, best_dup_key
 
 

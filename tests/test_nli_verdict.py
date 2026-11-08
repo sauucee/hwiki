@@ -202,6 +202,74 @@ class AnnotationWiringTests(unittest.TestCase):
         self.assertEqual(stub.calls, [])
 
 
+class DuplicateWiringTests(unittest.TestCase):
+    """HWIKI_NLI_DUP: a paraphrase under the similarity bar becomes a duplicate."""
+
+    def setUp(self):
+        self.embedder = facts.Embedder(mode="hash")
+        self.pair = [("k", "User prefers short status updates")]
+
+    def test_off_by_default(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(verdict.ENV_DUP, None)
+            _rel, _conf, dup = facts.related_and_conflict(
+                "User prefers terse status updates", self.pair, self.embedder)
+        self.assertIsNone(dup)
+
+    def test_paraphrase_is_treated_as_a_duplicate(self):
+        # 0.888 blended on the hash tier: under the 0.90 similarity bar, inside the
+        # 0.75 model band. This is precisely the miss the tier exists to catch.
+        with mock.patch.dict(os.environ, {verdict.ENV_DUP: "1"}), \
+                mock.patch.object(verdict, "try_get_scorer",
+                                  return_value=_Stub(entailment=0.99)):
+            _rel, _conf, dup = facts.related_and_conflict(
+                "User prefers short status updates please", self.pair, self.embedder)
+        self.assertEqual(dup, "k")
+
+    def test_a_contradiction_is_never_a_duplicate(self):
+        with mock.patch.dict(os.environ, {verdict.ENV_DUP: "1"}), \
+                mock.patch.object(verdict, "try_get_scorer",
+                                  return_value=_Stub(contradiction=1.0)):
+            _rel, _conf, dup = facts.related_and_conflict(
+                "User prefers terse status updates", self.pair, self.embedder)
+        self.assertIsNone(dup)
+
+    def test_a_refinement_is_not_a_duplicate(self):
+        with mock.patch.dict(os.environ, {verdict.ENV_DUP: "1"}), \
+                mock.patch.object(verdict, "try_get_scorer",
+                                  return_value=_Stub(neutral=1.0)):
+            _rel, _conf, dup = facts.related_and_conflict(
+                "Staging is on Fly.io and runs the worker",
+                [("k", "Staging is on Fly.io")], self.embedder)
+        self.assertIsNone(dup)
+
+    def test_missing_model_changes_nothing(self):
+        with mock.patch.dict(os.environ, {verdict.ENV_DUP: "1"}), \
+                mock.patch.object(verdict, "try_get_scorer", return_value=None):
+            _rel, _conf, dup = facts.related_and_conflict(
+                "User prefers terse status updates", self.pair, self.embedder)
+        self.assertIsNone(dup)
+
+    def test_a_low_scoring_candidate_never_reaches_the_model(self):
+        stub = _Stub(entailment=0.99)
+        with mock.patch.dict(os.environ, {verdict.ENV_DUP: "1"}), \
+                mock.patch.object(verdict, "try_get_scorer", return_value=stub):
+            facts.related_and_conflict("Deploys happen on Fridays",
+                                       [("k", "User prefers short replies")], self.embedder)
+        self.assertEqual(stub.calls, [], "below the 0.75 bar, the model must not run")
+
+    def test_existing_duplicate_wins_over_the_model(self):
+        # 0.909 blended already clears the similarity bar, so nothing extra is asked.
+        stub = _Stub(entailment=0.99)
+        with mock.patch.dict(os.environ, {verdict.ENV_DUP: "1"}), \
+                mock.patch.object(verdict, "try_get_scorer", return_value=stub):
+            _rel, _conf, dup = facts.related_and_conflict(
+                "Backups run nightly with restic to B2 and B3",
+                [("k", "Backups run nightly with restic to B2")], self.embedder)
+        self.assertEqual(dup, "k")
+        self.assertEqual(stub.calls, [], "no model call when similarity already decides")
+
+
 class RealModelTests(unittest.TestCase):
     """Runs only where the bundle exists; the fast suite must not require it."""
 
