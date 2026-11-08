@@ -242,7 +242,33 @@ hypothesis, and entailment(question, claim) measured zero signal. Do not rebuild
 Failure mode is explicit: a missing bundle raises `NliUnavailable`, callers keep the
 previous behaviour, and nothing is guessed.
 
-## 13. Invariants this schema guarantees
+## 13. Autonomous maintenance
+
+`hermes hwiki maintain` (and the scheduled tick behind the turn hook) sweeps memory
+for work that a human should look at:
+
+| job | writes |
+|---|---|
+| `heal` | proposal rows recovered from extractor-written vault pages |
+| `conflicts` | nothing — reported on the maintenance page |
+| `duplicates` | nothing — reported |
+| `questions` | `meta.open_questions` |
+| `artifacts` | `index.md` when lint reports staleness |
+
+Its authority is deliberately narrow:
+
+* It **never** accepts, supersedes, merges or deletes a fact. Invariant 3 is unchanged:
+  the review gate remains the only way memory changes meaning.
+* It never invents provenance. Pages that are not extractor-written are skipped by
+  `heal`, not guessed at.
+* It writes exactly one derived page, `memory_dir/maintenance.md`, which carries no
+  `# claim` heading and is therefore never recallable as a fact.
+* It is bounded: cheapest jobs first, then a wall-clock budget, then it stops and says
+  what it skipped.
+* Unanswered questions are buffered **in memory** during recall (so recall stays a
+  pure read) and flushed to meta on the next turn.
+
+## 14. Invariants this schema guarantees
 
 1. The vault is authoritative; the SQLite index is disposable and rebuildable.
 2. `store.py` never writes outside `<root>/<memory_dir>`.

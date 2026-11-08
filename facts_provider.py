@@ -738,7 +738,56 @@ class FactsEngine:
             except Exception:
                 self._requeue(state, deferred, user_message)
                 logger.exception("facts: post_llm_call handler failed")
+            # Autonomous maintenance: bounded, at most once per interval, and always
+            # isolated — a failing tick must never cost the conversation its extraction.
+            self._maybe_maintain(store)
         return _handle_post_llm_call
+
+    def _maybe_maintain(self, store) -> None:
+        """Run one bounded maintenance tick when the interval has elapsed.
+
+        Writes only derived artifacts (memory_dir/maintenance.md, catalogs) and meta.
+        It never accepts, supersedes or merges a fact: the review gate stays the only
+        way memory changes meaning.
+        """
+        try:
+            from . import maintain as maintain_mod
+        except ImportError:  # pragma: no cover - loaded as a top-level module
+            try:
+                import maintain as maintain_mod  # type: ignore
+            except ImportError:
+                return
+        try:
+            # Persist unanswered questions every turn. The buffer is in-memory so that
+            # recall stays a pure read; flushing here means a question survives a
+            # restart, and costs one meta write on a path that already writes.
+            buffer = store.question_buffer()
+            if buffer is not None:
+                try:
+                    buffer.merge_into(store)
+                except Exception:
+                    pass
+            if not maintain_mod.due(store, self.config):
+                return
+            budget = int((self.config.get("maintenance") or {}).get(
+                "budget_ms", maintain_mod.DEFAULT_BUDGET_MS))
+            report = maintain_mod.run_maintenance(
+                store, self.vault_root, self.memory_rel,
+                embedder=getattr(store, "embedder", None),
+                budget_ms=budget,
+                question_buffer=store.question_buffer(),
+            )
+            if report.work_items:
+                logger.info("maintenance: %d work item(s) in %d ms",
+                            report.work_items, report.elapsed_ms)
+            try:
+                self._refresh_catalog(kind="maintain",
+                                      subject=f"{report.work_items} work item(s)",
+                                      detail="scheduled maintenance tick")
+            except Exception:
+                pass
+        except Exception:
+            logger.debug("maintenance tick skipped", exc_info=True)
 
     def _requeue(self, state, deferred, current_text):
         with self._state_lock:

@@ -206,6 +206,60 @@ def _cmd_confidence(query: str = "", as_json: bool = False) -> None:
     print(f"\n  {conf['caveat']}\n")
 
 
+def _cmd_maintain(as_json: bool = False, dry_run: bool = False,
+                  budget_ms: int = 0, force: bool = False) -> None:
+    """Run one bounded maintenance tick (derived artifacts only; never facts)."""
+    config, store, _backend = _load()
+    if store is None:
+        return
+    from .maintain import DEFAULT_BUDGET_MS, due, interval_hours, run_maintenance
+
+    if not force and not dry_run and not due(store, config):
+        hours = interval_hours(config)
+        print(f"\n  Not due (interval {hours:g}h). Use --force to run anyway.\n")
+        return
+
+    facts_store, _ = _facts_store(config)
+    if facts_store is None:
+        return
+    report = run_maintenance(
+        facts_store,
+        store.root,
+        Path(store.memory_dir),
+        embedder=getattr(facts_store, "embedder", None),
+        budget_ms=budget_ms or int((config.get("maintenance") or {}).get(
+            "budget_ms", DEFAULT_BUDGET_MS)),
+        write=not dry_run,
+        question_buffer=facts_store.question_buffer(),
+    )
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+        return
+    print("\nMaintenance" + (" (dry run, nothing written)" if dry_run else "") + "\n" + "-" * 46)
+    for job in report.jobs:
+        state = "ran" if job.ran else "skipped"
+        detail = job.skipped or " ".join(job.notes)
+        print(f"  {job.name:<11} {state:<8} {job.count:>3}  {detail}")
+    print(f"\n  {report.work_items} work item(s) in {report.elapsed_ms} ms"
+          f" (budget {report.budget_ms} ms)")
+    if report.conflicts:
+        print("\n  Possible contradictions:")
+        for a, b, score in report.conflicts:
+            print(f"    - {a[:70]}")
+            print(f"      vs {b[:70]}  ({score:.2f})")
+    if report.duplicates:
+        print("\n  Possible duplicates:")
+        for a, b, score in report.duplicates:
+            print(f"    - {a[:70]}")
+            print(f"      ~ {b[:70]}  ({score:.2f})")
+    if report.questions:
+        print("\n  Open questions:")
+        for question in report.questions[:10]:
+            print(f"    - {question[:90]}")
+    print(f"\n  Page: {report.path}" if report.written else "")
+    print()
+
+
 def _cmd_lint(as_json: bool = False, show_info: bool = False,
               semantic: bool = False) -> None:
     config, store, backend = _load()
@@ -455,6 +509,11 @@ def wiki_command(args) -> None:
     elif sub == "confidence":
         _cmd_confidence(" ".join(getattr(args, "query", []) or []),
                         bool(getattr(args, "confidence_json", False)))
+    elif sub == "maintain":
+        _cmd_maintain(bool(getattr(args, "maintain_json", False)),
+                      bool(getattr(args, "maintain_dry_run", False)),
+                      int(getattr(args, "maintain_budget", 0) or 0),
+                      bool(getattr(args, "maintain_force", False)))
     elif sub in ("catalog", "index-md"):
         _cmd_catalog()
     elif sub == "log":
@@ -515,6 +574,17 @@ def register_cli(subparser) -> None:
                       help="Search terms")
     conf.add_argument("--json", action="store_true", dest="confidence_json",
                      help="Machine-readable output")
+    maint = subs.add_parser(
+        "maintain", help="Run one bounded maintenance tick (contradictions, duplicates, "
+                         "open questions, stale catalogs)")
+    maint.add_argument("--json", action="store_true", dest="maintain_json",
+                       help="Machine-readable output")
+    maint.add_argument("--dry-run", action="store_true", dest="maintain_dry_run",
+                       help="Report only; write no page and no meta")
+    maint.add_argument("--budget-ms", type=int, default=0, dest="maintain_budget",
+                       help="Wall-clock budget for the tick (default from config)")
+    maint.add_argument("--force", action="store_true", dest="maintain_force",
+                       help="Run even when the interval has not elapsed")
     subs.add_parser("catalog", aliases=["index-md"],
                     help="Regenerate index.md (page catalog)")
     log = subs.add_parser("log", help="Show the last entries of log.md")

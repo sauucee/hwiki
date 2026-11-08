@@ -268,6 +268,42 @@ Off by default (165 MB RSS), no network at runtime, and a missing bundle raises
 [docs/configuration.md](docs/configuration.md) and the measurements in the project
 bundle's `benchmarks/phase4-nli-verdict.md`.
 
+## Autonomous maintenance
+
+Memory maintains itself on a bounded tick, the way Honcho's deriver runs in the
+background — but deterministic, offline, and with no authority to change facts.
+
+What a tick does, cheapest first:
+
+| job | what it does |
+|---|---|
+| `heal` | re-imports fact pages the index lost (the vault is authoritative) |
+| `conflicts` | sweeps accepted facts against each other for contradictions the propose-time check never saw |
+| `duplicates` | same sweep, looking for the same fact stated twice |
+| `questions` | writes down what recall could not answer |
+| `artifacts` | regenerates `index.md` when lint says it is stale |
+
+It writes exactly one derived page — `memory_dir/maintenance.md` — plus meta, and
+**never** accepts, supersedes, merges or deletes a fact. The review gate stays the
+only way memory changes meaning.
+
+```bash
+hermes hwiki maintain             # when due (default: every 24 h)
+hermes hwiki maintain --dry-run   # report only, write nothing
+hermes hwiki maintain --force     # ignore the interval
+hermes hwiki maintain --json      # machine-readable
+```
+
+The turn hook runs a tick when the interval has elapsed and flushes unanswered
+questions every turn, so they survive a restart. Both are isolated: a failing tick
+never costs the conversation its extraction. `maintenance.interval_hours = 0` turns
+the scheduled tick off entirely.
+
+Measured on a 14-fact vault with one planted conflict, one planted duplicate and two
+unanswered questions: **33 ms** of a 2000 ms budget, finding the conflict, the
+duplicate and both questions with facts unchanged. With `HWIKI_NLI_CONFLICT=1` it
+also finds a swapped-value contradiction the token rules miss.
+
 ## CLI
 
 ```bash
@@ -279,6 +315,7 @@ hermes hwiki lint --json         # same, machine-readable
 hermes hwiki plan --from notes.md  # read-only: what would happen to these claims?
 hermes hwiki file -q "Q" < ans.md   # file an answer back (same code as the tool)
 hermes hwiki confidence "query"  # is this hit set trustworthy? (--json)
+hermes hwiki maintain            # bounded tick: conflicts, duplicates, open questions
 hermes hwiki config              # resolved configuration
 hermes hwiki migrate --dry-run   # import facts from the holographic provider
 ```

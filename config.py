@@ -49,7 +49,8 @@ DEFAULTS: Dict[str, Any] = {
     "max_hits_per_page": 2,         # ranking partition: per-page chunk cap
     # Secondary pages: generated catalogs and mirrors must never outrank
     # curated synthesis. Suffix-matched, so a relocated copy stays demoted.
-    "demote_paths": ["log.md", "index.md", "wiki/memory/builtin-mirror.md"],
+    "demote_paths": ["log.md", "index.md", "wiki/memory/builtin-mirror.md",
+                     "maintenance.md"],
     "fetch_multiplier": 4,          # candidate over-fetch factor
     "mirror_builtin_memory": True,
     "mirror_page": "builtin-mirror",
@@ -57,6 +58,13 @@ DEFAULTS: Dict[str, Any] = {
     "catalog_enabled": True,        # maintain index.md + log.md
     "index_filename": "index.md",
     "log_filename": "log.md",
+    # Autonomous maintenance: a bounded tick that sweeps for contradictions and
+    # duplicates, records unanswered questions and refreshes stale catalogs. It never
+    # changes what memory contains — the review gate stays the only write path.
+    "maintenance": {
+        "interval_hours": 24,       # 0 disables the scheduled tick entirely
+        "budget_ms": 2000,          # wall-clock cap for one tick
+    },
     # Review-gated fact extraction/compile (consumed by FactsEngine).
     "facts": {
         # Merge an accepted fact into the page that already owns the topic

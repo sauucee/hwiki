@@ -107,6 +107,25 @@ No network at runtime; the model is on disk. If the bundle is missing every entr
 point raises `NliUnavailable` and callers keep the previous behaviour. See
 `benchmarks/phase4-nli-verdict.md`.
 
+### Maintenance (`maintenance`, on by default)
+
+```json
+{ "maintenance": { "interval_hours": 24, "budget_ms": 2000 } }
+```
+
+One bounded tick per interval, run from the turn hook and also available as
+`hermes hwiki maintain`. It reports contradictions and duplicates, records questions
+recall could not answer, and refreshes stale catalogs. It never changes what memory
+contains, and it writes only `memory_dir/maintenance.md` plus meta.
+
+`interval_hours: 0` disables the scheduled tick (the CLI verb still works with
+`--force`). `budget_ms` is a wall-clock cap: jobs are ordered cheapest first and the
+tick stops when it is spent, reporting what it skipped, so a tick cannot stall a turn.
+
+The contradiction and duplicate sweeps use deterministic signals by default. With
+`HWIKI_NLI_CONFLICT=1` the model is also consulted — on a 14-fact vault that found a
+swapped-value contradiction the token rules miss.
+
 ### Upgrading from the pre-1.0 `wiki` provider
 
 Early versions used the provider name `wiki`, the config file `wiki-memory.json`

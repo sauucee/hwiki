@@ -42,6 +42,37 @@ except ImportError:
 _NLI_DUP_MIN_SCORE = 0.75
 
 
+try:  # pragma: no cover - optional, only used to record unanswered questions
+    from . import maintain as maintain_mod
+except ImportError:
+    try:
+        import maintain as maintain_mod  # type: ignore
+    except ImportError:
+        maintain_mod = None
+
+
+# Recall is a read path, so a miss is buffered in memory and flushed by the next
+# maintenance tick instead of writing to SQLite on every empty lookup.
+_QUESTION_BUFFER = None
+
+
+def question_buffer():
+    """Process-wide buffer of questions recall could not answer."""
+    global _QUESTION_BUFFER
+    if _QUESTION_BUFFER is None and maintain_mod is not None:
+        _QUESTION_BUFFER = maintain_mod.QuestionBuffer()
+    return _QUESTION_BUFFER
+
+
+def _record_miss(query) -> None:
+    buffer = question_buffer()
+    if buffer is not None:
+        try:
+            buffer.note(query)
+        except Exception:  # pragma: no cover - never let telemetry break recall
+            pass
+
+
 def _nli_conflict_enabled() -> bool:
     """Opt-in only: importing/loading the model is not free."""
     if verdict_mod is None:
@@ -897,6 +928,10 @@ class ProposalStore:
 
     # -- meta (cross-session state that survives restarts) ------------------
 
+    def question_buffer(self):
+        """The process-wide buffer of unanswered questions (see maintain.py)."""
+        return question_buffer()
+
     def get_meta(self, key, default=""):
         with _db_connection(self.database) as conn:
             row = conn.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
@@ -1412,6 +1447,7 @@ class ProposalStore:
                     "score": round(score, 3), "source": "fact",
                 })
         if not scored:
+            _record_miss(query)
             return []
         best = max(r["score"] for r in scored)
         noise_floor = self.embedder.noise_floor
@@ -1425,6 +1461,7 @@ class ProposalStore:
             # explicit project scope is itself an intent signal: accept weaker matches
             floor = noise_floor * 0.55 if project else noise_floor
             if best < floor:
+                _record_miss(query)
                 return []
             cutoff = best - 0.15
             kept = [r for r in scored if r["score"] >= cutoff]
