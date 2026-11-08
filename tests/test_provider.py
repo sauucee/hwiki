@@ -113,7 +113,7 @@ def main() -> int:
 
         print("\n[2] tool schemas match the manager's expectations")
         schemas = provider.get_tool_schemas()
-        check("5 tools exposed", len(schemas) == 5, str(len(schemas)))
+        check("6 tools exposed", len(schemas) == 6, str(len(schemas)))
         names = []
         for raw in schemas:
             norm = normalize_tool_schema(raw)
@@ -288,6 +288,27 @@ def main() -> int:
               repr(res.get("memory_pages")))
         check("status declares untrusted exclusion", "raw" in res.get("untrusted_dirs_excluded", []))
         check("lint present", "lint" in res and "dangling_links" in res["lint"])
+
+        print("\n[11b] confidence tool (advisory abstention signal)")
+        conf = json.loads(provider.handle_tool_call(
+            "wiki_memory_confidence", {"query": "what answer style does the user prefer"}))
+        check("confidence ok", conf.get("success") is True, repr(conf)[:160])
+        for key in ("best", "margin", "overlap", "candidates", "floor", "confident", "caveat"):
+            check(f"confidence exposes {key}", key in conf, repr(sorted(conf)))
+        check("confidence carries the caveat",
+              conf.get("caveat") == "relatedness is not answerability", repr(conf.get("caveat")))
+        check("confidence advises restraint", "abstain" in str(conf.get("advice", "")).lower())
+        blank = json.loads(provider.handle_tool_call("wiki_memory_confidence", {"query": "  "}))
+        check("confidence requires a query", is_error(blank), repr(blank)[:120])
+        ro2 = WikiMemoryProvider(config=dict(cfg))
+        ro2.initialize("s-ro2", hermes_home=str(home), platform="cron", agent_context="cron")
+        check("confidence is advertised in a read-only context",
+              "wiki_memory_confidence" in [t["name"] for t in ro2.get_tool_schemas()])
+        ro_conf = json.loads(ro2.handle_tool_call(
+            "wiki_memory_confidence", {"query": "what answer style does the user prefer"}))
+        check("confidence is readable in a read-only context",
+              ro_conf.get("success") is True, repr(ro_conf)[:160])
+        ro2.shutdown()
 
         print("\n[12] unknown tool + uninitialized provider")
         res = json.loads(provider.handle_tool_call("wiki_memory_bogus", {}))

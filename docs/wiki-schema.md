@@ -202,6 +202,12 @@ hermes hwiki confidence "where does staging run" [--json]
 It prints `confident`, `best` vs `floor`, `margin`, `overlap`, the candidate count
 and the caveat. `--json` emits exactly the seven documented keys.
 
+The same signal is a **read-only tool**, `wiki_memory_confidence`, advertised in every
+context including cron and subagent runs (it writes nothing, so the read-only gate
+does not cover it). It returns the seven keys plus an `advice` string instructing the
+caller to abstain and ask rather than guess. The tool is the point: an agent that
+cannot see the signal cannot choose to abstain.
+
 ## 11. Filing answers back
 
 `hermes hwiki file -q "<question>" [--from answer.md] [--tags a,b] [--json]`

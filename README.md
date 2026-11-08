@@ -237,6 +237,7 @@ hits from saved raw materials.
 | `wiki_memory_read` | Full page by path, slug or `[[wikilink]]`, with links and backlinks |
 | `wiki_memory_write` | Append a dated fact to a page in the memory zone |
 | `wiki_memory_file` | File a synthesised answer as a reusable page (`answers/`) |
+| `wiki_memory_confidence` | Is this retrieval trustworthy? Advisory signal for abstaining |
 | `wiki_memory_status` | Index stats; with `lint`, dangling links and orphan pages |
 
 The fact layer (`facts.py`) additionally stamps every recall hit with a citation:

@@ -227,6 +227,34 @@ WIKI_STATUS_SCHEMA = {
     },
 }
 
+WIKI_CONFIDENCE_SCHEMA = {
+    "name": "wiki_memory_confidence",
+    "description": (
+        "Check whether a memory retrieval is trustworthy BEFORE answering from it.\n\n"
+        "Returns the top score against the noise floor, the margin over the runner-up, "
+        "lexical overlap, the candidate count and a boolean `confident`.\n\n"
+        "USE WHEN: you are about to state a remembered fact and want to know if the "
+        "evidence is thin, ambiguous or absent.\n"
+        "READ THE CAVEAT: `confident` means the retrieval is not empty and not "
+        "ambiguous. It does NOT mean the fact answers the question. If `confident` is "
+        "false, say what you do not know or ask, rather than guessing."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The question you are trying to answer from memory.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "How many facts to consider (default 8).",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Provider
@@ -634,7 +662,7 @@ class WikiMemoryProvider(MemoryProvider):
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         schemas = [WIKI_SEARCH_SCHEMA, WIKI_READ_SCHEMA, WIKI_WRITE_SCHEMA,
-                   WIKI_FILE_SCHEMA, WIKI_STATUS_SCHEMA]
+                   WIKI_FILE_SCHEMA, WIKI_STATUS_SCHEMA, WIKI_CONFIDENCE_SCHEMA]
         if self._read_only:
             # Don't advertise a tool we will refuse — a cron/subagent run
             # shouldn't waste turns discovering the write path is closed.
@@ -664,6 +692,8 @@ class WikiMemoryProvider(MemoryProvider):
                 return self._tool_file(args)
             if tool_name == "wiki_memory_status":
                 return self._tool_status(args)
+            if tool_name == "wiki_memory_confidence":
+                return self._tool_confidence(args)
             if self._facts is not None and tool_name.startswith("memory_"):
                 result = self._facts.handle_tool_call(
                     tool_name, args, tool_error,
@@ -783,6 +813,30 @@ class WikiMemoryProvider(MemoryProvider):
                                   detail="filed an answer")
         result["path"] = self._store.relpath(Path(result["path"]))
         return json.dumps(result, ensure_ascii=False)
+
+    def _tool_confidence(self, args: Dict[str, Any]) -> str:
+        """Advisory: is this retrieval trustworthy? Never changes what recall does."""
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return tool_error("query is required")
+        if self._facts is None:
+            return tool_error(
+                "the facts layer is not active, so there is no confidence signal; "
+                "use wiki_memory_search instead"
+            )
+        limit = max(1, min(int(args.get("limit") or 8), 20))
+        try:
+            conf = self._facts.store().recall_confidence(query, limit=limit)
+        except Exception as exc:
+            logger.debug("wiki memory: confidence failed: %s", exc)
+            return tool_error(f"could not measure confidence: {exc}")
+        payload: Dict[str, Any] = {"success": True}
+        payload.update(conf)
+        payload["advice"] = (
+            "Say what you know with its score, or abstain and ask. Do not treat "
+            "`confident: true` as proof the fact answers the question."
+        )
+        return json.dumps(payload, ensure_ascii=False)
 
     def _tool_status(self, args: Dict[str, Any]) -> str:
         self._maybe_reindex()
