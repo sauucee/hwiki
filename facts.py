@@ -30,6 +30,24 @@ try:  # pragma: no cover - import style depends on how the module is loaded
 except ImportError:  # loaded as a top-level module
     import answerability as answerability_mod
 
+try:  # pragma: no cover - optional NLI tier, may be absent entirely
+    from . import verdict as verdict_mod
+except ImportError:
+    try:
+        import verdict as verdict_mod  # type: ignore
+    except ImportError:
+        verdict_mod = None
+
+
+def _nli_conflict_enabled() -> bool:
+    """Opt-in only: importing/loading the model is not free."""
+    if verdict_mod is None:
+        return False
+    try:
+        return verdict_mod.enabled()
+    except Exception:  # pragma: no cover - defensive
+        return False
+
 
 # Value-shape detection: reject secret MATERIAL (assignments, real token
 # formats, key blobs), not discussion ABOUT secrets — so a rule like
@@ -321,6 +339,31 @@ def related_and_conflict(claim, others, embedder,
         if _negation_signal(rel["text"]) != claim_negated:
             conflict = True
             break
+
+    # Optional second opinion from the local NLI model. Off by default, because
+    # loading it costs ~0.2 s and 165 MB of RSS on a path that must stay cheap.
+    # It never changes `conflict`: measured on a labelled 21-pair set, the model
+    # finds 7/7 genuine contradictions against the negation rule's 1/7, but also
+    # calls 3 compatible pairs contradictory (see benchmarks/phase4-nli-verdict.md).
+    # So it annotates each candidate with a `relation` for the reviewer and is
+    # reported separately as `tension` — a flag to read, not a verdict to act on.
+    tension = False
+    if related and _nli_conflict_enabled():
+        try:
+            scorer = verdict_mod.try_get_scorer()
+        except Exception:  # pragma: no cover - defensive
+            scorer = None
+        if scorer is not None:
+            for rel in related[:3]:
+                try:
+                    relation = verdict_mod.classify_pair(claim, rel["text"], scorer)
+                except Exception:  # pragma: no cover - model hiccup
+                    break
+                rel["relation"] = relation["relation"]
+                rel["nli"] = {"contradiction": relation["contradiction"],
+                              "entailment": relation["entailment"]}
+                if relation["relation"] == "contradiction":
+                    tension = True
     return related, conflict, best_dup_key
 
 

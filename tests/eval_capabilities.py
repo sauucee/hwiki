@@ -151,10 +151,28 @@ def probe_conflict_detection(emb):
     swapped = flagged("Staging runs on Fly.io", "Staging runs on Hetzner")
     restated = flagged("The user prefers terse status updates",
                        "The user prefers short status updates")
+
+    # Opt-in second opinion (HWIKI_NLI_CONFLICT=1): the local MNLI cross-encoder.
+    # Measurements are from the labelled 21-pair set in tests/_probe_nli.py.
+    nli_note = "nli tier not installed"
+    try:
+        import os as _os
+        from hwiki import nli as _nli, verdict as _verdict
+        if _nli.nli_model_dir().is_dir():
+            scorer = _nli.try_get_scorer()
+            if scorer is not None:
+                pair = _verdict.classify_pair(
+                    "Staging runs on Fly.io", "Staging runs on Hetzner", scorer)
+                nli_note = (
+                    f"nli available (opt-in {_verdict.ENV_ENABLE}=1): annotated "
+                    f"{pair['relation']} at c={pair['contradiction']}; measured "
+                    "recall 7/7, false-positive 3/14")
+    except Exception as exc:  # pragma: no cover - probe only
+        nli_note = f"nli tier unavailable ({exc})"
+
     row("Contradiction handling", "PARTIAL",
         f"negation flagged={negation}; swapped-value flagged={swapped} "
-        f"(measured: not detectable — a token heuristic also mis-flags "
-        f"'runs on Fly.io' vs 'runs Postgres'); restatement flagged={restated}. "
+        f"(token rules miss it); restatement flagged={restated}. {nli_note}. "
         "Flagged for a human, never adjudicated.")
 
 

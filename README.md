@@ -246,6 +246,23 @@ the fact was approved). Only the slug is exposed — never the absolute path. Se
 [docs/wiki-schema.md](docs/wiki-schema.md) for the full agent-facing contract:
 source trust, approval states, provenance fields, citations, and lint severity.
 
+### Optional local NLI tier
+
+`HWIKI_NLI_CONFLICT=1` adds a bundled MNLI cross-encoder (DeBERTa-v3-small, int8
+ONNX) that annotates each `related` candidate with the relation it reads —
+`contradiction`, `restatement` or `compatible` — plus the raw probabilities.
+
+It is an annotation, never the decision: `possible_conflict` stays negation-only.
+Measured on a labelled 21-pair set, the token rules find 1 of 7 genuine
+contradictions; the model finds 7 of 7 but reads 3 of 14 compatible pairs as
+contradictory. `restatement` is the practical win — it catches paraphrases that
+similarity missed (`terse`/`short` at 0.997 entailment).
+
+Off by default (165 MB RSS), no network at runtime, and a missing bundle raises
+`NliUnavailable` rather than guessing. See
+[docs/configuration.md](docs/configuration.md) and the measurements in the project
+bundle's `benchmarks/phase4-nli-verdict.md`.
+
 ## CLI
 
 ```bash

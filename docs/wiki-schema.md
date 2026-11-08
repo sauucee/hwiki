@@ -220,7 +220,26 @@ between two *different* questions gives the newcomer a `-<digest>` sister file
 rather than overwriting; answers stay out of accepted-fact recall and out of the
 review queue.
 
-## 12. Invariants this schema guarantees
+## 12. Optional NLI tier (advisory annotation)
+
+`hwiki/nli.py` loads a bundled MNLI cross-encoder (DeBERTa-v3-small, int8 ONNX) and
+`hwiki/verdict.py` turns it into a fact-pair relation. It is **opt-in**
+(`HWIKI_NLI_CONFLICT=1`) and it is an **annotation**, not a verdict:
+
+* `possible_conflict` stays negation-only, so the flag keeps its high precision and
+the default path is byte-for-byte unchanged.
+* With the tier on, each `related` candidate gains `relation`
+(`contradiction` / `restatement` / `compatible`) plus the raw probabilities.
+* Measured: 7/7 genuine contradictions found where the token rules find 1/7, at the
+cost of 3/14 compatible pairs wrongly read as contradictory. Both numbers travel
+with the feature.
+* It cannot answer "does this fact answer this question?" — a question is not a
+hypothesis, and entailment(question, claim) measured zero signal. Do not rebuild that.
+
+Failure mode is explicit: a missing bundle raises `NliUnavailable`, callers keep the
+previous behaviour, and nothing is guessed.
+
+## 13. Invariants this schema guarantees
 
 1. The vault is authoritative; the SQLite index is disposable and rebuildable.
 2. `store.py` never writes outside `<root>/<memory_dir>`.

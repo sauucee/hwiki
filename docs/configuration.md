@@ -36,8 +36,8 @@ Configuration lives in `$HERMES_HOME/hwiki.json` (`$HERMES_HOME` is `~/.hermes`,
 ### Environment overrides
 
 Environment variables win over the file: `HWIKI_PATH`, `HWIKI_BACKEND`,
-`HWIKI_MEMORY_DIR`, `HWIKI_QMD_BINARY`, `HWIKI_QMD_MODE`, and
-`HWIKI_ANSWERABILITY`.
+`HWIKI_MEMORY_DIR`, `HWIKI_QMD_BINARY`, `HWIKI_QMD_MODE`,
+`HWIKI_ANSWERABILITY`, `HWIKI_NLI_CONFLICT`, and `HWIKI_NLI_DIR`.
 
 ### Answer-type gate (`HWIKI_ANSWERABILITY`, off by default)
 
@@ -65,6 +65,29 @@ project bundle for the measurements and the two rejected hypotheses.
 
 Also settable per-store (`ProposalStore(db, answerability=True)`) and per-call
 (`recall(query, answerability=True)`); an explicit argument beats the env var.
+
+### NLI second opinion (`HWIKI_NLI_CONFLICT`, off by default)
+
+An optional local MNLI cross-encoder (DeBERTa-v3-small, int8 ONNX, ~165 MB) that
+reads the *relation between two facts*. `HWIKI_NLI_CONFLICT=1` annotates each
+`related` candidate with `relation` (`contradiction` / `restatement` /
+`compatible`) and the raw probabilities. `HWIKI_NLI_DIR` points at the bundle
+(default `<hermes_home>/plugins-data/hwiki-extractor/models/nli-deberta-small`).
+
+It deliberately **does not** set `possible_conflict`. Measured on a labelled
+21-pair set: the shipped negation rule catches 1 of 7 genuine contradictions with
+no false positives; the model catches 7 of 7 but also calls 3 of 14 compatible
+pairs contradictory (different slots, same subject, different scope). So the flag
+stays precise and the model adds recall under its own label, for a human to read.
+
+It also cannot answer the original question — "does this fact *answer* this
+question?" — because a question is not a hypothesis: entailment(question, claim)
+measured 0.000 median for correct answers and 0.000 for refusals. That formulation
+is rejected and recorded so it is not retried.
+
+No network at runtime; the model is on disk. If the bundle is missing every entry
+point raises `NliUnavailable` and callers keep the previous behaviour. See
+`benchmarks/phase4-nli-verdict.md`.
 
 ### Upgrading from the pre-1.0 `wiki` provider
 
