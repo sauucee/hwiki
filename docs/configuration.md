@@ -141,6 +141,19 @@ token, whole blocks only — a block is either in or out, never cut mid-sentence
 least one block always survives. Priority: recalled facts, then gaps/conflicts/duplicates,
 then builtin memory, then wiki text. `0` disables the cap.
 
+### Query-embedding cache (`embeddings.cache_size`)
+
+```json
+{ "embeddings": { "mode": "auto", "cache_size": 128 } }
+```
+
+Exact-match, bounded LRU over the query text. Measured on the ONNX tier: recall of a
+repeated query **7.6 ms cold → 0.92 ms warm**. The lexical (`hash`) tier gains ~nothing —
+it was already ~2 ms — so the cache is about the model tier only. `0` disables it.
+
+It is deliberately exact-match: a fuzzy key would answer a different question with the
+previous vector, which is the kind of silence this project refuses.
+
 ### Choosing a tier by cost
 
 | tier | RSS | recall p50 | disk |

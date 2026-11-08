@@ -292,6 +292,14 @@ The `NO` rows cluster into one capability — generation. Deduction, induction, 
 and session summaries all need a model that writes prose: 2–8 GB of RSS against this
 project's **1.4 MB** with no model at all. That is a scope decision, not a backlog item.
 
+## Query cache
+
+Query embeddings are cached by exact text (`embeddings.cache_size`, default 128, `0`
+disables), because the same question gets asked more than once — a prefetch warmed and then
+used, a confidence probe over a recall. Measured on the ONNX tier: **7.6 ms cold → 0.92 ms
+warm** for a repeated recall. The lexical tier gains ~nothing, so this is a model-tier
+optimisation.
+
 ## Prompt budget
 
 The injected block is capped by `max_context_tokens` (default 1200; `0` disables), not by

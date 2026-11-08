@@ -11,6 +11,8 @@ Ported from the standalone hwiki-extractor plugin when it merged into hwiki
 """
 
 from contextlib import contextmanager
+from collections import OrderedDict
+
 import hashlib
 import json
 import math
@@ -18,6 +20,7 @@ import os
 import re
 import sqlite3
 import struct
+import threading
 import sys
 import time
 import uuid
@@ -260,11 +263,33 @@ class Embedder:
     NOISE_FLOOR_ONNX = 0.26
     NOISE_FLOOR_HASH = 0.18
 
-    def __init__(self, mode: str = "auto", model_dir=None):
+    # Query text repeats constantly: the same question asked twice, a prefetch warmed and
+    # then used, a confidence probe over a recall. Re-embedding the query is ~20 of the
+    # ~22 ms a recall costs on the ONNX tier, so a small exact-match cache removes most of
+    # it. Deliberately NOT a fuzzy cache: an approximate key would silently answer a
+    # different question with the previous vector.
+    DEFAULT_CACHE_SIZE = 128
+
+    def __init__(self, mode: str = "auto", model_dir=None, cache_size=None):
         self.mode = mode
         self._onnx = None
         self._onnx_failed = False
         self.model_dir = model_dir
+        self._cache_size = (self.DEFAULT_CACHE_SIZE if cache_size is None
+                            else max(0, int(cache_size)))
+        self._cache = OrderedDict()
+        self._cache_lock = threading.Lock()
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def cache_info(self) -> dict:
+        with self._cache_lock:
+            return {"size": len(self._cache), "limit": self._cache_size,
+                    "hits": self.cache_hits, "misses": self.cache_misses}
+
+    def clear_cache(self) -> None:
+        with self._cache_lock:
+            self._cache.clear()
 
     @property
     def noise_floor(self):
@@ -301,6 +326,25 @@ class Embedder:
     def embed(self, text: str) -> bytes:
         # invariant: embed NEVER raises — the optional tier can fail in any
         # state (load, session, inference) and the caller always gets a vector
+        key = " ".join(str(text or "").split())     # "  Foo bar " hits "Foo bar"
+        if self._cache_size:
+            with self._cache_lock:
+                cached = self._cache.get(key)
+                if cached is not None:
+                    self._cache.move_to_end(key)
+                    self.cache_hits += 1
+                    return cached
+                self.cache_misses += 1
+        vector = self._embed_uncached(key)
+        if self._cache_size and vector:
+            with self._cache_lock:
+                self._cache[key] = vector
+                self._cache.move_to_end(key)
+                while len(self._cache) > self._cache_size:
+                    self._cache.popitem(last=False)
+        return vector
+
+    def _embed_uncached(self, text: str) -> bytes:
         try:
             onnx = self._try_onnx()
             if onnx is not None:

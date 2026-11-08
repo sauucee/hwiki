@@ -104,8 +104,10 @@ def _facts_store(config):
         print(f"\n  No facts database at {db}")
         print("  Nothing has been accepted yet, so there are no facts to read.\n")
         return None, None
-    mode = (config.get("embeddings") or {}).get("mode", "auto")
-    return ProposalStore(str(db), embedder=Embedder(mode=mode)), "facts"
+    embeddings = config.get("embeddings") or {}
+    return ProposalStore(str(db), embedder=Embedder(
+        mode=embeddings.get("mode", "auto"),
+        cache_size=embeddings.get("cache_size"))), "facts"
 
 
 def _cmd_plan(source_file: str = "", as_json: bool = False) -> None:

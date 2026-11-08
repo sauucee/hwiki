@@ -42,7 +42,9 @@ DEFAULT_CONFIG = {
     "review": {"cadence_turns": REVIEW_CADENCE_TURNS, "decay_days": 90,
                "proposal_ttl_days": 14},
     "diary": {"enabled": True},
-    "embeddings": {"mode": "auto"},
+    # cache_size: exact-match query-embedding cache; 0 disables. Bounded, because the
+    # keys are user text and an unbounded cache is a slow memory leak.
+    "embeddings": {"mode": "auto", "cache_size": 128},
 }
 
 EXTRACT_PROMPT = (
@@ -224,9 +226,12 @@ class FactsEngine:
             data_dir = self.data_dir()
             data_dir.mkdir(parents=True, exist_ok=True)
             self._migrate_legacy()
-            mode = self.config.get("embeddings", {}).get("mode", "auto")
+            embeddings = self.config.get("embeddings") or {}
+            mode = embeddings.get("mode", "auto")
             self._store = ProposalStore(str(data_dir / "facts.sqlite"),
-                                        embedder=Embedder(mode=mode))
+                                        embedder=Embedder(
+                                            mode=mode,
+                                            cache_size=embeddings.get("cache_size")))
             self._heal_from_vault()
         return self._store
 

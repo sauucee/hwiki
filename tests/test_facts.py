@@ -441,6 +441,96 @@ class EmbeddingTests(unittest.TestCase):
         self.assertEqual(len(vec), 2048 * 4)
 
 
+class EmbeddingCacheTests(unittest.TestCase):
+    """A repeated query must not be re-embedded — but never a *different* query."""
+
+    def _counting(self, size=4):
+        emb = Embedder(mode="hash", cache_size=size)
+        calls = {"n": 0}
+        original = emb._embed_uncached
+
+        def counted(text):
+            calls["n"] += 1
+            return original(text)
+
+        emb._embed_uncached = counted
+        return emb, calls
+
+    def test_a_repeated_query_is_embedded_once(self):
+        emb, calls = self._counting()
+        first = emb.embed("where does staging run")
+        second = emb.embed("where does staging run")
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(first, second)
+
+    def test_different_queries_are_both_embedded(self):
+        emb, calls = self._counting()
+        emb.embed("where does staging run")
+        emb.embed("how often do backups run")
+        self.assertEqual(calls["n"], 2)
+
+    def test_whitespace_does_not_defeat_the_cache(self):
+        emb, calls = self._counting()
+        emb.embed("where does staging run")
+        emb.embed("  where   does staging   run  ")
+        self.assertEqual(calls["n"], 1)
+
+    def test_a_near_miss_is_not_a_hit(self):
+        """Exact match only: an approximate key would answer the wrong question."""
+        emb, calls = self._counting()
+        emb.embed("where does staging run")
+        emb.embed("where does production run")
+        self.assertEqual(calls["n"], 2)
+
+    def test_the_cache_is_bounded_and_evicts_oldest(self):
+        emb, calls = self._counting(size=2)
+        for text in ("a one", "b two", "c three"):
+            emb.embed(text)
+        info = emb.cache_info()
+        self.assertEqual(info["size"], 2)
+        emb.embed("a one")                  # evicted, so embedded again
+        self.assertEqual(calls["n"], 4)
+
+    def test_zero_disables_the_cache(self):
+        emb, calls = self._counting(size=0)
+        emb.embed("where does staging run")
+        emb.embed("where does staging run")
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(emb.cache_info()["size"], 0)
+
+    def test_hits_and_misses_are_counted(self):
+        emb, _calls = self._counting()
+        emb.embed("x query")
+        emb.embed("x query")
+        emb.embed("y query")
+        self.assertEqual(emb.cache_info()["hits"], 1)
+        self.assertEqual(emb.cache_info()["misses"], 2)
+
+    def test_a_cached_vector_is_identical_not_recomputed(self):
+        emb = Embedder(mode="hash", cache_size=8)
+        first = emb.embed("backups run nightly")
+        self.assertEqual(first, hash_embedding("backups run nightly"))
+        self.assertEqual(emb.embed("backups run nightly"), first)
+
+    def test_recall_benefits_from_a_warm_query_cache(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            store = ProposalStore(Path(tmp.name) / "f.sqlite",
+                                  embedder=Embedder(mode="hash", cache_size=32))
+            proposal = store.propose({"kind": "fact", "claim": "Staging stays on Fly.io",
+                                      "evidence": "said"}, user_text="said",
+                                     session_id="s")
+            store.accept(proposal["id"])
+            query = "where does staging run"
+            store.recall(query)              # cold: query embedded once
+            before = store.embedder.cache_info()["hits"]
+            store.recall(query)              # warm: query embedding served from cache
+            after = store.embedder.cache_info()["hits"]
+            self.assertEqual(after, before + 1)
+        finally:
+            tmp.cleanup()
+
+
 class VaultTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

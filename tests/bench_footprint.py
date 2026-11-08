@@ -76,15 +76,25 @@ def child(mode: str) -> None:
                               "Deploys are never allowed on Fridays")
     loaded = _vmrss_mb()
 
+    # Cold and warm are measured separately and reported separately: the query cache
+    # makes repeats ~9x cheaper, and a single blended number would hide which is which.
     queries = ["where does staging run", "which database do we use",
                "how often do backups run", "who is on call"]
-    latencies = []
+    cold = []
+    for _ in range(5):
+        for query in queries:
+            started = time.perf_counter()
+            store.recall(f"{query} {time.perf_counter_ns()}", limit=5)  # never a hit
+            cold.append((time.perf_counter() - started) * 1000.0)
+    warm = []
     for _ in range(5):
         for query in queries:
             started = time.perf_counter()
             store.recall(query, limit=5)
-            latencies.append((time.perf_counter() - started) * 1000.0)
-    latencies.sort()
+            warm.append((time.perf_counter() - started) * 1000.0)
+    cold.sort()
+    warm.sort()
+    latencies = cold
 
     started = time.perf_counter()
     report = run_maintenance(store, root, Path("Hermes/Memory/Auto"),
@@ -98,8 +108,11 @@ def child(mode: str) -> None:
         "rss_base_mb": base,
         "rss_loaded_mb": loaded,
         "rss_delta_mb": round(loaded - base, 1),
-        "recall_p50_ms": round(statistics.median(latencies), 2),
-        "recall_p95_ms": round(latencies[int(len(latencies) * 0.95) - 1], 2),
+        "recall_cold_p50_ms": round(statistics.median(cold), 2),
+        "recall_cold_p95_ms": round(cold[int(len(cold) * 0.95) - 1], 2),
+        "recall_warm_p50_ms": round(statistics.median(warm), 2),
+        "recall_warm_p95_ms": round(warm[int(len(warm) * 0.95) - 1], 2),
+        "embed_cache": store.embedder.cache_info(),
         "maintain_ms": round(tick_ms, 1),
         "maintain_work_items": report.work_items,
         "page_bytes": round(statistics.mean(p.stat().st_size for p in pages), 0) if pages else 0,
