@@ -261,8 +261,10 @@ Its authority is deliberately narrow:
   the review gate remains the only way memory changes meaning.
 * It never invents provenance. Pages that are not extractor-written are skipped by
   `heal`, not guessed at.
-* It writes exactly one derived page, `memory_dir/maintenance.md`, which carries no
-  `# claim` heading and is therefore never recallable as a fact.
+* It writes exactly one derived page, `memory_dir/maintenance.md`. It carries no
+  `# claim` heading, so it is never a fact — and its concrete path is **hard-excluded**
+  by `config.excluded_paths()` (not just `demote_paths`), because a demoted page still
+  came back for an ops query and the report reads like authority.
 * It is bounded: cheapest jobs first, then a wall-clock budget, then it stops and says
   what it skipped.
 * Unanswered questions are buffered **in memory** during recall (so recall stays a
@@ -271,6 +273,10 @@ Its authority is deliberately narrow:
   prefetch block as *"Memory gaps this looks like (ask, do not assume)"*. It is
   presented as a question to ask, never as a fact to assert — surfacing a gap must not
   become inventing an answer.
+* Contradiction pairs are stored in `meta.maintenance_conflicts` and surfaced the same
+  way, with both claims quoted and neither ranked. A pair that a human resolves
+  disappears on the next tick, because the list is replaced wholesale.
+* The read path never re-runs a sweep to answer a prefetch: it reads two meta keys.
 
 ## 14. Invariants this schema guarantees
 

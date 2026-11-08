@@ -53,6 +53,7 @@ from .config import (
     CONFIG_FILENAME,
     DEFAULTS,
     build_runtime,
+    excluded_paths,
     default_index_path,
     expand_path as _expand,
     load_config,
@@ -330,7 +331,10 @@ class WikiMemoryProvider(MemoryProvider):
         self._store = WikiStore(
             root,
             include=self._config.get("include") or ["**/*.md"],
-            exclude=self._config.get("exclude") or [],
+            # generated artifacts included: this used to pass the raw exclude list and
+            # silently diverged from build_runtime, so the CLI excluded the maintenance
+            # report and the provider recalled it.
+            exclude=excluded_paths(self._config),
             untrusted_dirs=self._config.get("untrusted_dirs") or [],
             memory_dir=str(self._config.get("memory_dir") or "wiki/memory"),
         )
@@ -560,6 +564,9 @@ class WikiMemoryProvider(MemoryProvider):
                 gap = self._open_question_hint(query)
                 if gap:
                     parts.append(gap)
+                disagreement = self._conflict_hint(query)
+                if disagreement:
+                    parts.append(disagreement)
             except Exception as exc:
                 logger.debug("wiki memory: fact recall fusion failed: %s", exc)
         if wiki_part:
@@ -584,6 +591,57 @@ class WikiMemoryProvider(MemoryProvider):
                 logger.debug("wiki memory: queue_prefetch failed: %s", exc)
 
         threading.Thread(target=_run, daemon=True, name="wiki-memory-prefetch").start()
+
+    def _conflict_hint(self, query: str) -> str:
+        """Raise a recorded fact pair that disagrees about what this is about.
+
+        The maintenance tick stores the pairs it found; reusing them keeps the read
+        path free (no sweep, no model). Both sides are quoted and neither is ranked, so
+        the agent cannot silently pick the one that reads better — the point is to make
+        it ask.
+        """
+        try:
+            import json as _json
+            from . import maintain as maintain_mod
+        except ImportError:  # pragma: no cover - loaded as a top-level module
+            try:
+                import json as _json
+                import maintain as maintain_mod  # type: ignore
+            except ImportError:
+                return ""
+        try:
+            pairs = _json.loads(
+                self._facts.store().get_meta(maintain_mod.META_CONFLICTS) or "[]")
+        except Exception:
+            return ""
+        if not isinstance(pairs, list) or not pairs:
+            return ""
+        try:
+            tokenise = facts_mod._tokens
+        except AttributeError:
+            logger.debug("wiki memory: token helper unavailable; no conflict hint")
+            return ""
+        query_tokens = set(tokenise(query))
+        if not query_tokens:
+            return ""
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+            a, b = pair.get("a"), pair.get("b")
+            if not isinstance(a, str) or not isinstance(b, str) or not a or not b:
+                continue
+            reach = set(tokenise(a)) | set(tokenise(b))
+            shared = query_tokens & reach
+            if not shared:
+                continue
+            score = len(shared) / max(1, min(len(query_tokens), len(reach)))
+            if score < 0.6:
+                continue
+            return ("**Two stored facts disagree — ask which is right:**\n"
+                    f"- \"{a[:160]}\"\n"
+                    f"- \"{b[:160]}\"\n"
+                    "Neither has been changed.")
+        return ""
 
     def _open_question_hint(self, query: str) -> str:
         """Raise an unanswered question this conversation is about.

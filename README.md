@@ -283,7 +283,8 @@ What a tick does, cheapest first:
 | `questions` | writes down what recall could not answer |
 | `artifacts` | regenerates `index.md` when lint says it is stale |
 
-It writes exactly one derived page — `memory_dir/maintenance.md` — plus meta, and
+It writes exactly one derived page — `memory_dir/maintenance.md`, which is
+hard-excluded from search, not merely demoted — plus meta, and
 **never** accepts, supersedes, merges or deletes a fact. The review gate stays the
 only way memory changes meaning.
 
@@ -298,6 +299,11 @@ Recorded questions are not just written down: when the current query is about on
 of them, the prefetch block says so explicitly — *"Memory gaps this looks like (ask,
 do not assume)"*. Memory that knows what it does not know can ask, instead of
 improvising an answer.
+
+Contradictions work the same way. The pairs a tick finds are kept in meta, so a
+conversation about one of them gets both sides quoted — *"Two stored facts disagree —
+ask which is right"* — and neither is ranked. The memory cannot resolve a disagreement,
+and pretending otherwise would be worse than staying quiet.
 
 The turn hook runs a tick when the interval has elapsed and flushes unanswered
 questions every turn, so they survive a restart. Both are isolated: a failing tick

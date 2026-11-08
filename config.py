@@ -20,7 +20,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +159,29 @@ def save_config_file(values: Dict[str, Any], hermes_home: str) -> Path:
     return path
 
 
+def excluded_paths(config: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Everything a search must never surface, in addition to the user's settings.
+
+    Generated reports are *artifacts*, not knowledge. Demoting them only loses ranking
+    weight — an ops question still retrieved the maintenance page as wiki content, which
+    is exactly the noise `demote_paths` was supposed to prevent. So the concrete path is
+    hard-excluded here.
+
+    This lives in one function because it used to live in two: the provider built its
+    own WikiStore and never saw the exclusion that `build_runtime` added, so the fix
+    applied to nobody. Callers must not re-implement it.
+    """
+    config = config or {}
+    memory_rel = str(config.get("memory_dir") or "wiki/memory").strip("/")
+    patterns: List[str] = list(config.get("exclude") or [])
+    # keep in step with maintain.MAINTENANCE_FILENAME (not imported: cycle risk)
+    for name in ("maintenance.md",):
+        pattern = f"{memory_rel}/{name}" if memory_rel else name
+        if pattern not in patterns:
+            patterns.append(pattern)
+    return patterns
+
+
 def default_index_path(hermes_home: str = "") -> str:
     """``$HERMES_HOME/hwiki-index.sqlite`` (disposable; rebuilt on demand)."""
     base = Path(hermes_home) if hermes_home else Path(resolve_hermes_home())
@@ -181,12 +204,13 @@ def build_runtime(config: Optional[Dict[str, Any]] = None):
     if not root or not Path(root).is_dir():
         return config, None, None
 
+    memory_rel = str(config.get("memory_dir") or "wiki/memory")
     store = WikiStore(
         root,
         include=config.get("include") or ["**/*.md"],
-        exclude=config.get("exclude") or [],
+        exclude=excluded_paths(config),
         untrusted_dirs=config.get("untrusted_dirs") or [],
-        memory_dir=str(config.get("memory_dir") or "wiki/memory"),
+        memory_dir=memory_rel,
     )
 
     index_path = expand_path(str(config.get("index_path") or ""), home) or default_index_path(home)

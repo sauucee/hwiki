@@ -347,6 +347,120 @@ class GapHintTests(unittest.TestCase):
         self.assertEqual(self.provider.prefetch("what is the escalation policy?"), "")
 
 
+class ConflictHintTests(GapHintTests):
+    """A stored disagreement must reach the agent, and never be resolved by it."""
+
+    def _record_conflict(self, a="Deploys are allowed on Fridays",
+                         b="Deploys are never allowed on Fridays"):
+        self.provider._facts.store().set_meta(maintain.META_CONFLICTS, json.dumps(
+            [{"a": a, "b": b, "score": 1.0, "at": "2026-11-08T00:00:00+00:00"}]))
+
+    def test_a_relevant_disagreement_shows_both_sides(self):
+        self._record_conflict()
+        block = self.provider.prefetch("are deploys allowed on fridays?")
+        self.assertIn("Deploys are allowed on Fridays", block)
+        self.assertIn("Deploys are never allowed on Fridays", block)
+        self.assertIn("ask which is right", block)
+
+    def test_it_does_not_pick_a_side(self):
+        self._record_conflict()
+        block = self.provider.prefetch("are deploys allowed on fridays?")
+        self.assertIn("Neither has been changed", block)
+        # no verb that would present one claim as the answer
+        for word in ("recommend", "should use", "prefer the", "correct one"):
+            self.assertNotIn(word, block.lower())
+
+    def test_an_unrelated_query_is_not_warned(self):
+        self._record_conflict()
+        self.assertEqual(self.provider.prefetch("which editor do they use"), "")
+
+    def test_a_corrupt_conflict_list_does_not_break_prefetch(self):
+        self.provider._facts.store().set_meta(maintain.META_CONFLICTS, "not json at all")
+        self.assertEqual(self.provider.prefetch("are deploys allowed on fridays?"), "")
+
+    def test_malformed_entries_are_ignored(self):
+        self.provider._facts.store().set_meta(maintain.META_CONFLICTS, json.dumps(
+            [{"a": None, "b": "x"}, {"a": "Deploys are allowed on Fridays"},
+             "not a dict"]))
+        self.assertEqual(self.provider.prefetch("deploys allowed"), "")
+
+    def test_gaps_and_disagreements_can_both_appear(self):
+        self._record(["when are deploys allowed on fridays?"])
+        self._record_conflict()
+        block = self.provider.prefetch("are deploys allowed on fridays?")
+        self.assertIn("Memory gaps", block)
+        self.assertIn("disagree", block)
+
+
+class ReportExclusionTests(GapHintTests):
+    """The generated report is an artifact; it must never be recalled as knowledge."""
+
+    def setUp(self):
+        super().setUp()
+        (self.wiki / "Hermes" / "Memory" / "Auto" / maintain.MAINTENANCE_FILENAME).write_text(
+            "---\ntitle: Memory maintenance\ntype: maintenance\n---\n\n"
+            "# Memory maintenance\n\nDeploys are allowed on Fridays vs never allowed.\n",
+            encoding="utf-8")
+        self.provider.shutdown()
+        self.provider = self._provider()   # rebuild so the index sees the page
+
+    def test_the_report_never_reaches_recall(self):
+        block = self.provider.prefetch("deploys allowed fridays")
+        self.assertNotIn(maintain.MAINTENANCE_FILENAME, block)
+
+    def test_excluded_paths_covers_the_report_once(self):
+        from hwiki.config import excluded_paths
+
+        paths = excluded_paths({"memory_dir": "Hermes/Memory/Auto",
+                                "exclude": ["raw/*"]})
+        self.assertIn("Hermes/Memory/Auto/maintenance.md", paths)
+        self.assertIn("raw/*", paths)
+        self.assertEqual(len(paths), len(set(paths)))
+        self.assertEqual(paths.count("Hermes/Memory/Auto/maintenance.md"), 1)
+
+    def test_a_users_own_maintenance_page_elsewhere_still_works(self):
+        from hwiki.config import excluded_paths
+
+        paths = excluded_paths({"memory_dir": "wiki/memory"})
+        self.assertNotIn("notes/maintenance.md", paths)
+
+
+class ConflictPersistenceTests(_Vault):
+    """The tick's findings must reach the read path, and stop when they are resolved."""
+
+    def _tick(self, *, write=True):
+        return maintain.run_maintenance(self.store, self.vault, Path(MEMORY_REL),
+                                        embedder=self.store.embedder, write=write,
+                                        question_buffer=maintain.QuestionBuffer())
+
+    def test_found_pairs_are_written_to_meta(self):
+        self.accept("Deploys are allowed on Fridays")
+        self.accept("Deploys are never allowed on Fridays")
+        report = self._tick()
+        self.assertEqual(len(report.conflicts), 1)
+        stored = json.loads(self.store.get_meta(maintain.META_CONFLICTS))
+        self.assertEqual(len(stored), 1)
+        self.assertIn("Deploys are allowed on Fridays", (stored[0]["a"], stored[0]["b"]))
+
+    def test_a_resolved_pair_stops_being_reported(self):
+        self.accept("Deploys are allowed on Fridays")
+        self.accept("Deploys are never allowed on Fridays")
+        self._tick()
+        self.assertTrue(json.loads(self.store.get_meta(maintain.META_CONFLICTS)))
+        # a human supersedes one side; the next tick must forget the pair
+        victim = self.store.list_proposals(status="accepted", limit=1)[0]
+        survivor = self.store.list_proposals(status="accepted", limit=10)[1]
+        self.store.supersede(survivor["id"], victim["id"])
+        self._tick()
+        self.assertEqual(json.loads(self.store.get_meta(maintain.META_CONFLICTS)), [])
+
+    def test_dry_run_writes_no_meta(self):
+        self.accept("Deploys are allowed on Fridays")
+        self.accept("Deploys are never allowed on Fridays")
+        self._tick(write=False)
+        self.assertFalse(self.store.get_meta(maintain.META_CONFLICTS))
+
+
 class RenderTests(_Vault):
     def test_page_carries_the_required_frontmatter(self):
         report = self.tick()

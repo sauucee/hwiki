@@ -37,6 +37,7 @@ cannot stall a conversation.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -47,6 +48,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 MAINTENANCE_FILENAME = "maintenance.md"
 META_LAST_RUN = "maintenance_last_run"
 META_OPEN_QUESTIONS = "open_questions"
+# The pairs found by the last tick, so the prefetch path can raise one without a sweep.
+META_CONFLICTS = "maintenance_conflicts"
 DEFAULT_INTERVAL_HOURS = 24
 DEFAULT_BUDGET_MS = 2000
 
@@ -174,7 +177,9 @@ def render(report: MaintenanceReport, *, memory_dir: Optional[Path] = None) -> s
     lines.append("")
     if report.conflicts:
         lines.append("Two accepted facts may disagree. Neither has been changed — "
-                     "resolve by hand or let the fact be superseded.")
+                     "resolve by hand or let the fact be superseded. These pairs are "
+                     "also stored in meta, so a conversation about one of them is told "
+                     "about the disagreement instead of silently trusting either side.")
         lines.append("")
         for a, b, score in report.conflicts:
             lines.append(f"- **{a}**")
@@ -447,6 +452,12 @@ def run_maintenance(store, vault_root, memory_rel, *, embedder=None,
             report.written = True
             report.path = str(target)
             store.set_meta(META_LAST_RUN, report.ran_at)
+            # Keep the pair list where a turn can reach it cheaply: the prefetch path
+            # must not pay for a sweep. Replaced wholesale each tick, so a conflict
+            # that a human resolved stops being raised.
+            store.set_meta(META_CONFLICTS, json.dumps(
+                [{"a": a, "b": b, "score": s, "at": report.ran_at}
+                 for a, b, s in report.conflicts][:MAX_LISTED]))
         except Exception:
             report.written = False
     return report

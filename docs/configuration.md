@@ -122,6 +122,10 @@ contains, and it writes only `memory_dir/maintenance.md` plus meta.
 `--force`). `budget_ms` is a wall-clock cap: jobs are ordered cheapest first and the
 tick stops when it is spent, reporting what it skipped, so a tick cannot stall a turn.
 
+The generated report is hard-excluded from search via `config.excluded_paths()`, which
+also carries the user's own `exclude` list. A user page named `maintenance.md` elsewhere
+in the vault is unaffected — only the concrete report path is excluded.
+
 The contradiction and duplicate sweeps use deterministic signals by default. With
 `HWIKI_NLI_CONFLICT=1` the model is also consulted — on a 14-fact vault that found a
 swapped-value contradiction the token rules miss.
