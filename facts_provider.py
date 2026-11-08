@@ -210,6 +210,9 @@ class FactsEngine:
         self._session_state: "OrderedDict[str, dict]" = OrderedDict()
         self._state_lock = threading.Lock()
         self.read_only = False
+        # proposal id -> owner page path, for facts merged into an existing page
+        self._compiled_pages: Dict[str, str] = {}
+        self._catalog_store_cache = None
 
     # -- store + config ----------------------------------------------------
 
@@ -329,10 +332,130 @@ class FactsEngine:
             page = write_fact_page(self.vault_root, self.memory_rel, proposal,
                                    supersedes_claim=supersedes_claim)
             store.set_page_path(proposal_id, page)
+            # Compile runs strictly AFTER the review gate: the fact is already
+            # accepted and safely on its own page. Merging it into the page
+            # that owns the topic is an improvement, never a precondition —
+            # any failure leaves the standalone page exactly as written above.
+            try:
+                if (self._compile_enabled() and not self.read_only
+                        and self._compile_page_path(proposal, page)):
+                    return self._compiled_pages.get(proposal["id"], page)
+            except Exception:
+                logger.debug("facts: compile failed, keeping standalone page",
+                             exc_info=True)
             return page
         except Exception:
             logger.exception("facts: promote failed for %s", proposal_id)
             return None
+
+    def _compile_enabled(self) -> bool:
+        """Whether this engine may merge accepted facts into owner pages."""
+        return bool(self.config.get("compile_enabled", True))
+
+    def _candidate_owners(self, proposal) -> List[Dict[str, Any]]:
+        """Pages that already own a claim related to this proposal."""
+        store = self.store()
+        candidates: List[Dict[str, Any]] = []
+        for entry in (proposal.get("related") or []):
+            if not isinstance(entry, dict) or not entry.get("key"):
+                continue
+            try:
+                neighbour = store.get(entry["key"])
+            except Exception:
+                continue
+            if not neighbour or neighbour.get("status") not in ("accepted", "superseded"):
+                continue
+            path = neighbour.get("page_path")
+            if not path or not Path(path).exists():
+                continue
+            candidates.append({
+                "path": path,
+                "claim": neighbour.get("claim", ""),
+                "score": float(entry.get("score") or 0.0),
+                # A conflict-flagged proposal must never be folded into the
+                # claim it disagrees with — the contradiction stays visible.
+                "conflict": bool(proposal.get("possible_conflict")),
+                "is_self": neighbour.get("id") == proposal.get("id"),
+                "merged_count": self._merged_section_count(path),
+            })
+        return candidates
+
+    @staticmethod
+    def _merged_section_count(path) -> int:
+        try:
+            from .compile import existing_sections
+            return len(existing_sections(Path(path).read_text(
+                encoding="utf-8", errors="replace")))
+        except Exception:
+            return 0
+
+    def _compile_page_path(self, proposal, own_page) -> bool:
+        """Merge ``proposal`` into an existing owner page, if one qualifies.
+
+        On success the standalone page is removed and lineage repointed, so the
+        vault has one page per topic instead of two near-duplicates. Any refusal
+        leaves the standalone page untouched (pre-compile behaviour).
+        """
+        from .compile import choose_owner, merge_into_page
+
+        owner = choose_owner(self._candidate_owners(proposal))
+        if not owner:
+            return False
+        accepted_iso = ""
+        if proposal.get("accepted_at"):
+            try:
+                from datetime import datetime, timezone
+                accepted_iso = datetime.fromtimestamp(
+                    proposal["accepted_at"], tz=timezone.utc).strftime("%Y-%m-%d")
+            except Exception:
+                accepted_iso = ""
+        result = merge_into_page(
+            Path(owner["path"]), proposal.get("claim", ""),
+            evidence=str(proposal.get("evidence") or ""),
+            kind=str(proposal.get("kind") or "fact"),
+            accepted_iso=accepted_iso,
+            proposal_id=str(proposal.get("id") or ""),
+            peer=str(proposal.get("peer") or "user"),
+        )
+        if not result.merged:
+            return False
+        # The claim now lives in the owner page's compiled section.
+        try:
+            own = Path(own_page)
+            if own.exists() and own.resolve() != Path(owner["path"]).resolve():
+                own.unlink()
+        except OSError:
+            logger.debug("facts: could not remove merged standalone page", exc_info=True)
+        try:
+            self.store().set_page_path(proposal["id"], owner["path"])
+        except Exception:
+            logger.debug("facts: could not repoint page_path", exc_info=True)
+        self._compiled_pages[proposal["id"]] = owner["path"]
+        try:
+            catalog_store = self._catalog_store()
+            if catalog_store is not None:
+                from .catalog import append_log
+                append_log(catalog_store, "compile",
+                           str(proposal.get("claim") or "")[:120],
+                           detail=f"merged into {Path(owner['path']).name}")
+        except Exception:
+            logger.debug("facts: compile log entry failed", exc_info=True)
+        self._audit(f"compile: merged fact {proposal.get('id','')[:8]} into "
+                    f"{Path(owner['path']).name}")
+        return True
+
+    def _catalog_store(self):
+        """A WikiStore over the vault root, for catalog log entries."""
+        cached = getattr(self, "_catalog_store_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            from .store import WikiStore
+            cached = WikiStore(self.vault_root, memory_dir=str(self.memory_rel))
+            self._catalog_store_cache = cached
+        except Exception:
+            cached = None
+        return cached
 
     def _audit(self, text):
         try:
@@ -798,9 +921,32 @@ class FactsEngine:
                                                           REVIEW_CADENCE_TURNS),
                 "decay_days": self.config_value("review", "decay_days", 90),
                 "proposal_ttl_days": self.config_value("review", "proposal_ttl_days", 14),
+                "compile": {
+                    "enabled": self._compile_enabled() and not self.read_only,
+                    "merged_this_process": len(self._compiled_pages),
+                    "merged_pages": self._merged_page_count(),
+                },
                 "read_only": self.read_only,
             })
         return None
+
+    def _merged_page_count(self) -> int:
+        """How many memory pages carry compiled sections."""
+        try:
+            memory_dir = self.vault_root / self.memory_rel
+            if not memory_dir.is_dir():
+                return 0
+            total = 0
+            for page in memory_dir.glob("*.md"):
+                try:
+                    text = page.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if "<!-- hwiki:compiled:start -->" in text:
+                    total += 1
+            return total
+        except Exception:
+            return 0
 
     # -- recall fusion -------------------------------------------------------
 

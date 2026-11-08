@@ -27,6 +27,7 @@ Configuration lives in `$HERMES_HOME/hwiki.json` (`$HERMES_HOME` is `~/.hermes`,
 | `catalog_enabled` | `true` | Maintain `index.md` (page catalog) and `log.md` (append-only timeline) in the wiki root. Disabled automatically in read-only agent contexts. |
 | `index_filename` | `index.md` | Name of the generated catalog. Written to the wiki root, never into `memory_dir`. |
 | `log_filename` | `log.md` | Name of the generated event log. |
+| `compile_enabled` | `true` | Merge an accepted fact into the page that already owns the topic, as a delimited `###` section, instead of creating a near-duplicate page. Runs strictly after the review gate; any failure leaves the standalone page intact. Conflicts are never merged. Set `false` to reproduce v2.0 behaviour. Disabled in read-only contexts. |
 | `qmd_binary` | `qmd` | Path or name of the qmd executable. |
 | `qmd_collection` | `hwiki` | qmd collection name. |
 | `qmd_mode` | `search` | `search` (BM25), `vsearch` (vector), `query` (hybrid + rerank). |

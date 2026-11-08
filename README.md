@@ -81,7 +81,60 @@ hermes hwiki catalog   # regenerate index.md
 hermes hwiki log       # show the last 10 events (--limit N)
 ```
 
-`wiki_memory_status` reports both files under a `catalog` key.
+`wiki_memory_status` reports both files under a `catalog` key, and log entries
+are written for `compile` and `file` events as well as plain writes.
+
+## Compile: one page per topic (v2.1)
+
+The older behaviour appended every accepted fact to its own page, so a user
+who refined a preference three times ended up with three near-duplicate pages.
+`compile` fixes that: when a fact is accepted and an existing page already
+owns the topic, the new claim is merged into that page as a delimited section
+instead of becoming a page of its own.
+
+Compile runs **strictly after the review gate** — the fact is already accepted
+and already written to its own page before any merging is attempted. Four
+guarantees, each covered by a test:
+
+1. **Never lose a fact.** Any failure leaves the standalone page in place.
+2. **Never silently contradict.** A conflict-flagged proposal is never folded
+   into the claim it disagrees with; contradictions keep their own page.
+3. **Never clobber hand edits.** Only the region between the
+   `<!-- hwiki:compiled:start/end -->` delimiters is touched; frontmatter gains
+   `compiled_sections` and a fresh `updated`. Everything else survives byte for
+   byte, so editing a page in Obsidian is safe.
+4. **Never raise.** A compile error cannot break an accepted write.
+
+Merged claims stay recallable: `read_fact_pages` emits each compiled section as
+its own fact, so a merge is invisible to retrieval. Merging is idempotent —
+re-running it on the same claim is a no-op. Disable with `compile_enabled:
+false` in `hwiki.json`; the provider then reproduces the v2.0 behaviour exactly.
+
+Owner selection uses the similarity already computed when the proposal was
+scored (`related[].score`), so it costs no extra embedding call. The bar is
+0.62 — deliberately low, because the point is to catch *refinements of the same
+topic*, and the conflict check plus the idempotency check do the real safety
+work. Ties break toward the page with fewer merged sections.
+
+## Filing an answer back (v2.1)
+
+`wiki_memory_file` turns a synthesised answer into a page, so an exploration
+compounds instead of disappearing into chat history:
+
+```json
+{"question": "How do I rotate the deploy key?",
+ "answer": "Revoke, regenerate, redeploy, verify.", "tags": "ops, keys"}
+```
+
+Filed answers land in `answers/` **inside** `memory_dir` — the only tree this
+provider may write — but segregated from accepted facts, so they never enter
+fact recall or the review queue. They are ordinary pages for search purposes.
+The text is secret-scanned before anything touches disk, and filing is
+idempotent: the same question returns the existing page rather than
+overwriting it. Two *different* questions that slugify alike get separate
+files (`-<sha1>` suffix) so the first is never clobbered.
+
+## Navigation catalog: `index.md` + `log.md` (v2.1)
 
 ## Recall quality (1.1.0)
 
@@ -182,6 +235,7 @@ hits from saved raw materials.
 | `wiki_memory_search` | Ranked excerpts across the wiki (optional frontmatter filter) |
 | `wiki_memory_read` | Full page by path, slug or `[[wikilink]]`, with links and backlinks |
 | `wiki_memory_write` | Append a dated fact to a page in the memory zone |
+| `wiki_memory_file` | File a synthesised answer as a reusable page (`answers/`) |
 | `wiki_memory_status` | Index stats; with `lint`, dangling links and orphan pages |
 
 ## CLI

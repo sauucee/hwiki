@@ -404,6 +404,25 @@ def write_fact_page(vault_root: Path, memory_rel: Path, proposal: Dict[str, Any]
     return page
 
 
+def _compiled_sections(text: str) -> List[str]:
+    """Claim headings inside ``compile``'s delimited sections.
+
+    Kept local and regex-only (no import of ``compile.py``) so this recall path
+    has no dependency on the write-side module.
+    """
+    out: List[str] = []
+    for block in re.findall(
+            r"<!-- hwiki:compiled:start -->(.*?)<!-- hwiki:compiled:end -->",
+            text or "", re.DOTALL):
+        for line in block.splitlines():
+            if line.startswith("### "):
+                claim = line[4:].strip()
+                if claim:
+                    out.append(claim)
+                break
+    return out
+
+
 def read_fact_pages(vault_root: Path, memory_rel: Path, max_facts: int = 25) -> List[Dict[str, Any]]:
     """Parse extractor-written fact pages (skips superseded), ranked for injection."""
     memory_dir = vault_root / memory_rel
@@ -427,13 +446,24 @@ def read_fact_pages(vault_root: Path, memory_rel: Path, max_facts: int = 25) -> 
             "accepted_at": meta.get("accepted_at", ""),
             "path": str(page),
         })
+        # Claims merged into this page by `compile` live as ### sections, not
+        # as the H1. Without this they would be accepted facts that recall can
+        # never see — the one failure mode compile must not introduce.
+        for section in _compiled_sections(text):
+            facts.append({
+                "claim": section,
+                "kind": meta.get("kind", "fact"),
+                "peer": meta.get("peer", "user"),
+                "project": meta.get("project", ""),
+                "accepted_at": meta.get("accepted_at", ""),
+                "path": str(page),
+            })
     facts.sort(key=lambda f: (KIND_PRIORITY.get(f["kind"], 9), f["accepted_at"]), reverse=True)
     facts.sort(key=lambda f: KIND_PRIORITY.get(f["kind"], 9))
     return facts[:max_facts]
 
 
 GUARDRAIL_KINDS = ("blocker", "correction")
-
 
 def render_profile(facts: List[Dict[str, Any]], max_chars: int = 3500,
                    usage: Optional[Dict[str, int]] = None) -> str:

@@ -57,6 +57,13 @@ DEFAULTS: Dict[str, Any] = {
     "catalog_enabled": True,        # maintain index.md + log.md
     "index_filename": "index.md",
     "log_filename": "log.md",
+    # Review-gated fact extraction/compile (consumed by FactsEngine).
+    "facts": {
+        # Merge an accepted fact into the page that already owns the topic
+        # instead of creating a near-duplicate page. Runs strictly after the
+        # review gate; any failure leaves the standalone page intact.
+        "compile_enabled": True,
+    },
 }
 
 _ENV_OVERRIDES = {

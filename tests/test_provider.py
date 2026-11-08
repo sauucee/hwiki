@@ -113,7 +113,7 @@ def main() -> int:
 
         print("\n[2] tool schemas match the manager's expectations")
         schemas = provider.get_tool_schemas()
-        check("4 tools exposed", len(schemas) == 4, str(len(schemas)))
+        check("5 tools exposed", len(schemas) == 5, str(len(schemas)))
         names = []
         for raw in schemas:
             norm = normalize_tool_schema(raw)

@@ -23,8 +23,10 @@ Config lives in ``$HERMES_HOME/hwiki.json``; see README.md.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
+import re
 import threading
 import time
 from datetime import date
@@ -169,6 +171,39 @@ WIKI_WRITE_SCHEMA = {
             },
         },
         "required": ["content"],
+    },
+}
+
+ANSWERS_SUBDIR = "answers"
+
+WIKI_FILE_SCHEMA = {
+    "name": "wiki_memory_file",
+    "description": (
+        "File a synthesised answer back into the wiki as a page, so an "
+        "exploration compounds instead of disappearing into chat history.\n\n"
+        "USE WHEN: you just produced an analysis, comparison, or synthesis the user "
+        "is likely to want again — the kind of thing worth re-reading later.\n"
+        "DO NOT use for: transient progress, one-line facts (use wiki_memory_write), "
+        "or anything containing secrets.\n\n"
+        "Idempotent: filing the same question twice returns the existing page."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The question or prompt this answer responds to.",
+            },
+            "answer": {
+                "type": "string",
+                "description": "The answer/synthesis, as markdown.",
+            },
+            "tags": {
+                "type": "string",
+                "description": "Comma-separated tags (optional).",
+            },
+        },
+        "required": ["question", "answer"],
     },
 }
 
@@ -597,11 +632,13 @@ class WikiMemoryProvider(MemoryProvider):
     # -- tools -------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        schemas = [WIKI_SEARCH_SCHEMA, WIKI_READ_SCHEMA, WIKI_WRITE_SCHEMA, WIKI_STATUS_SCHEMA]
+        schemas = [WIKI_SEARCH_SCHEMA, WIKI_READ_SCHEMA, WIKI_WRITE_SCHEMA,
+                   WIKI_FILE_SCHEMA, WIKI_STATUS_SCHEMA]
         if self._read_only:
             # Don't advertise a tool we will refuse — a cron/subagent run
             # shouldn't waste turns discovering the write path is closed.
-            schemas = [s for s in schemas if s is not WIKI_WRITE_SCHEMA]
+            schemas = [s for s in schemas
+                       if s is not WIKI_WRITE_SCHEMA and s is not WIKI_FILE_SCHEMA]
         if self._facts is not None:
             for fact_schema in self._facts.tool_schemas(self._read_only):
                 full = {"name": fact_schema["name"],
@@ -622,6 +659,8 @@ class WikiMemoryProvider(MemoryProvider):
                 return self._tool_read(args)
             if tool_name == "wiki_memory_write":
                 return self._tool_write(args)
+            if tool_name == "wiki_memory_file":
+                return self._tool_file(args)
             if tool_name == "wiki_memory_status":
                 return self._tool_status(args)
             if self._facts is not None and tool_name.startswith("memory_"):
@@ -713,6 +752,111 @@ class WikiMemoryProvider(MemoryProvider):
             "duplicate": result["duplicate"],
             "note": ("An equivalent fact was already recorded; nothing appended."
                      if result["duplicate"] else "Fact filed to long-term memory."),
+        }, ensure_ascii=False)
+
+    def _tool_file(self, args: Dict[str, Any]) -> str:
+        """File a synthesised answer back into the wiki as a reusable page."""
+        if self._read_only:
+            return tool_error(
+                f"wiki memory is read-only in agent_context='{self._agent_context}'. "
+                "Only the primary agent may file answers into the wiki."
+            )
+        question = " ".join(str(args.get("question") or "").split())
+        answer = str(args.get("answer") or "").strip()
+        if not question:
+            return tool_error("question is required")
+        if not answer:
+            return tool_error("answer is required")
+
+        # Same guard as the write path: a filed answer is durable vault text.
+        found = scan_for_secrets(question + "\n" + answer)
+        if found:
+            return tool_error(
+                "refusing to file an answer containing apparent secret material "
+                f"({', '.join(found)}); cite where the secret lives instead"
+            )
+
+        tags = args.get("tags") or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+        # Answers live in their own subfolder of the memory zone: inside the
+        # only tree this provider may write, but clear of accepted facts so
+        # they never enter fact recall or the review queue.
+        answers_dir = self._store.memory_root() / ANSWERS_SUBDIR
+        slug = slugify(question, fallback="answer")
+        target = answers_dir / f"{slug}.md"
+
+        if target.exists():
+            try:
+                previous = target.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                previous = ""
+            match = re.search(r"^# (.+)$", previous, re.M)
+            existing_question = match.group(1).strip() if match else ""
+            if existing_question.casefold() == question.casefold():
+                return json.dumps({
+                    "success": True,
+                    "path": self._store.relpath(target),
+                    "created_page": False,
+                    "duplicate": True,
+                    "note": "This question is already filed; nothing was overwritten.",
+                }, ensure_ascii=False)
+            # Slug collision between two different questions: never clobber
+            # the first answer, give the newcomer its own file.
+            digest = hashlib.sha1(question.encode("utf-8")).hexdigest()[:8]
+            target = answers_dir / f"{slug}-{digest}.md"
+            if target.exists():
+                return json.dumps({
+                    "success": True,
+                    "path": self._store.relpath(target),
+                    "created_page": False,
+                    "duplicate": True,
+                    "note": "This question is already filed; nothing was overwritten.",
+                }, ensure_ascii=False)
+
+        stamp = date.today().isoformat()
+        title = question[:160]
+        tag_line = ""
+        if tags:
+            tag_line = "\n" + " ".join(f"#{slugify(t)}" for t in tags if str(t).strip()) + "\n"
+        page_text = (
+            "---\n"
+            f"title: {title}\n"
+            "type: answer\n"
+            "status: filed\n"
+            "source: hwiki\n"
+            f"filed: {stamp}\n"
+            f"updated: {stamp}\n"
+            "---\n\n"
+            f"# {title}\n\n"
+            f"> **Filed:** {stamp} · from a conversation answer.\n\n"
+            f"{answer}\n"
+            f"{tag_line}"
+        )
+
+        tmp = target.with_name(target.name + ".tmp")
+        try:
+            answers_dir.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(page_text, encoding="utf-8")
+            tmp.replace(target)
+        except OSError as exc:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return tool_error(f"could not file answer: {exc}")
+
+        self._writes_this_session += 1
+        self._maybe_reindex(force=True)
+        self._refresh_catalog(kind="file", subject=title[:120],
+                              detail="filed an answer")
+        return json.dumps({
+            "success": True,
+            "path": self._store.relpath(target),
+            "created_page": True,
+            "duplicate": False,
+            "note": "Answer filed — searchable like any other page.",
         }, ensure_ascii=False)
 
     def _tool_status(self, args: Dict[str, Any]) -> str:
