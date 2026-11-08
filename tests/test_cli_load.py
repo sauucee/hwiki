@@ -115,6 +115,8 @@ def main() -> int:
             (["hwiki", "status"], "status"),
             (["hwiki", "index"], "index"),
             (["hwiki", "lint"], "lint"),
+            (["hwiki", "catalog"], "catalog"),
+            (["hwiki", "log"], "log"),
             (["hwiki", "config"], "config"),
             (["hwiki", "search", "soc", "2"], "search"),
             (["hwiki", "migrate", "--dry-run"], "migrate"),
@@ -149,6 +151,17 @@ def main() -> int:
 
         out = run(["hwiki", "lint"])
         check("lint runs", "Dangling wikilinks" in out, out[:160])
+
+        out = run(["hwiki", "catalog"])
+        check("catalog regenerates index.md", "Regenerated" in out and "index.md" in out, out[:200])
+        check("catalog writes to the wiki root", (root / "index.md").exists(), out[:200])
+        check("catalog lists a curated page", "[[le-chonk]]" in (root / "index.md").read_text())
+        check("catalog never writes into the memory zone",
+              not (root / "wiki" / "memory" / "index.md").exists(),
+              str(root / "wiki" / "memory"))
+
+        out = run(["hwiki", "log"])
+        check("log renders without a file", "No entries yet" in out or "Wiki log" in out, out[:200])
 
         out = run(["hwiki", "config"])
         check("config prints the file path", "hwiki.json" in out, out[:200])

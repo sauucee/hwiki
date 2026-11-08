@@ -57,6 +57,13 @@ from .config import (
     save_config_file,
 )
 
+try:  # catalog is a derived artifact; never brick the provider without it
+    from .catalog import append_log, read_log_tail, write_index
+    CATALOG_AVAILABLE = True
+except Exception as _catalog_exc:  # pragma: no cover
+    CATALOG_AVAILABLE = False
+    _CATALOG_IMPORT_ERROR = str(_catalog_exc)
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -291,6 +298,19 @@ class WikiMemoryProvider(MemoryProvider):
             self._init_error = f"initial index failed: {exc}"
             logger.warning("wiki memory: %s", self._init_error)
 
+        # Derived navigation artifacts (index.md + log.md). Off when the
+        # provider is read-only: a cron run must not rewrite the catalog.
+        self._catalog_enabled = bool(
+            self._config.get("catalog_enabled", True)) and not self._read_only
+        self._index_path = (self._store.root / str(
+            self._config.get("index_filename") or "index.md")) if self._store else None
+        self._log_path = (self._store.root / str(
+            self._config.get("log_filename") or "log.md")) if self._store else None
+        if self._catalog_enabled and not CATALOG_AVAILABLE:  # pragma: no cover
+            logger.warning("wiki memory: catalog module unavailable: %s",
+                           _CATALOG_IMPORT_ERROR)
+            self._catalog_enabled = False
+
         # review-gated fact write path (merged from hwiki-extractor, v2.0)
         try:
             self._facts = FactsEngine(
@@ -303,6 +323,10 @@ class WikiMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.warning("wiki memory: fact store unavailable: %s", exc)
             self._facts = None
+
+        # Catalog is regenerated only on startup and on writes — never on
+        # recall, so the hot path stays free of filesystem walks.
+        self._refresh_catalog()
 
     def shutdown(self) -> None:
         with self._lock:
@@ -376,6 +400,30 @@ class WikiMemoryProvider(MemoryProvider):
             logger.debug("wiki memory: reindex failed: %s", exc)
         finally:
             self._lock.release()
+
+    # -- catalogs (index.md / log.md) --------------------------------------
+
+    def _refresh_catalog(self, *, kind: str = "", subject: str = "",
+                         detail: str = "") -> None:
+        """Regenerate ``index.md`` and optionally append to ``log.md``.
+
+        Every failure is swallowed: these files are derived artifacts and a
+        catalog problem must never break recall or an accepted write.
+        """
+        if not (self._catalog_enabled and CATALOG_AVAILABLE) or self._store is None:
+            return
+        try:
+            if self._index_path is not None:
+                write_index(self._store, path=self._index_path,
+                            memory_dir=self._store.memory_dir)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("wiki memory: index regeneration failed: %s", exc)
+        if kind and self._log_path is not None:
+            try:
+                append_log(self._store, kind, subject, detail=detail,
+                           path=self._log_path)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("wiki memory: log append failed: %s", exc)
 
     # -- system prompt -----------------------------------------------------
 
@@ -652,6 +700,12 @@ class WikiMemoryProvider(MemoryProvider):
         )
         self._writes_this_session += 1
         self._maybe_reindex(force=True)
+        self._refresh_catalog(
+            kind="write",
+            subject=str(args.get("topic") or args.get("page") or result["path"]),
+            detail=("created page" if result["created"] else "appended note")
+                   + (" (duplicate, skipped)" if result["duplicate"] else ""),
+        )
         return json.dumps({
             "success": True,
             "path": result["path"],
@@ -689,6 +743,22 @@ class WikiMemoryProvider(MemoryProvider):
                 "dangling_links": dangling,
                 "orphan_pages": orphans[:50],
                 "orphan_count": len(orphans),
+            }
+        if self._catalog_enabled and CATALOG_AVAILABLE and self._store is not None:
+            entries: List[Dict[str, str]] = []
+            try:
+                entries = read_log_tail(self._store, limit=5, path=self._log_path)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("wiki memory: log read failed: %s", exc)
+            payload["catalog"] = {
+                "enabled": True,
+                "index": (self._store.relpath(self._index_path)
+                          if self._index_path is not None and self._index_path.exists()
+                          else None),
+                "log": (self._store.relpath(self._log_path)
+                        if self._log_path is not None and self._log_path.exists()
+                        else None),
+                "recent_log": entries,
             }
         return json.dumps(payload, ensure_ascii=False)
 

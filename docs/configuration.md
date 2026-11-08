@@ -21,9 +21,12 @@ Configuration lives in `$HERMES_HOME/hwiki.json` (`$HERMES_HOME` is `~/.hermes`,
 | `min_query_chars` | `8` | Skip recall for trivially short messages. |
 | `reindex_interval_s` | `60` | Minimum seconds between incremental reindexes. |
 | `max_hits_per_page` | `2` | Per-page chunk cap when ranking results. |
-| `demote_paths` | `["log.md", "wiki/memory/builtin-mirror.md"]` | Pages ranked after primary results. |
+| `demote_paths` | `["log.md", "index.md", "wiki/memory/builtin-mirror.md"]` | Pages ranked after primary results. Suffix-matched, so a relocated copy stays demoted. |
 | `mirror_builtin_memory` | `true` | Mirror built-in `memory` tool additions into the wiki. |
 | `mirror_page` | `builtin-mirror` | Memory page receiving those mirrors. |
+| `catalog_enabled` | `true` | Maintain `index.md` (page catalog) and `log.md` (append-only timeline) in the wiki root. Disabled automatically in read-only agent contexts. |
+| `index_filename` | `index.md` | Name of the generated catalog. Written to the wiki root, never into `memory_dir`. |
+| `log_filename` | `log.md` | Name of the generated event log. |
 | `qmd_binary` | `qmd` | Path or name of the qmd executable. |
 | `qmd_collection` | `hwiki` | qmd collection name. |
 | `qmd_mode` | `search` | `search` (BM25), `vsearch` (vector), `query` (hybrid + rerank). |

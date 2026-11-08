@@ -47,10 +47,16 @@ DEFAULTS: Dict[str, Any] = {
     "qmd_mode": "search",           # search | vsearch | query
     "qmd_timeout_s": 6.0,
     "max_hits_per_page": 2,         # ranking partition: per-page chunk cap
-    "demote_paths": ["log.md", "wiki/memory/builtin-mirror.md"],  # secondary pages
+    # Secondary pages: generated catalogs and mirrors must never outrank
+    # curated synthesis. Suffix-matched, so a relocated copy stays demoted.
+    "demote_paths": ["log.md", "index.md", "wiki/memory/builtin-mirror.md"],
     "fetch_multiplier": 4,          # candidate over-fetch factor
     "mirror_builtin_memory": True,
     "mirror_page": "builtin-mirror",
+    # LLM-wiki navigation artifacts (derived, regenerated on write).
+    "catalog_enabled": True,        # maintain index.md + log.md
+    "index_filename": "index.md",
+    "log_filename": "log.md",
 }
 
 _ENV_OVERRIDES = {

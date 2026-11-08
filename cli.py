@@ -24,6 +24,7 @@ from datetime import date
 from pathlib import Path
 
 from .config import CONFIG_FILENAME, build_runtime, load_config
+from .catalog import append_log, read_log_tail, write_index
 
 
 def _load():
@@ -104,6 +105,42 @@ def _cmd_lint() -> None:
     else:
         print("  Dangling wikilinks: none")
     print(f"  Orphan pages ({len(orphans)}): {', '.join(sorted(orphans)[:20]) or 'none'}")
+    print()
+
+
+def _cmd_catalog() -> None:
+    config, store, _backend = _load()
+    if store is None:
+        return
+    if not config.get("catalog_enabled", True):
+        print("\n  Catalog generation is disabled (catalog_enabled: false).\n")
+        return
+    index_name = str(config.get("index_filename") or "index.md")
+    log_name = str(config.get("log_filename") or "log.md")
+    path = write_index(store, path=store.root / index_name,
+                       memory_dir=store.memory_dir)
+    if path is None:
+        print(f"\n  Could not write {index_name} (see logs).\n")
+        return
+    pages = sum(1 for _ in store.iter_pages())
+    print(f"\n  Regenerated {path}  ({pages} page(s) indexed)")
+    if (store.root / log_name).exists():
+        print(f"  Log: {store.root / log_name}")
+    print()
+
+
+def _cmd_log(limit: int = 10) -> None:
+    config, store, _backend = _load()
+    if store is None:
+        return
+    log_name = str(config.get("log_filename") or "log.md")
+    entries = read_log_tail(store, limit=max(1, limit),
+                            path=store.root / log_name)
+    print("\nWiki log\n" + "-" * 46)
+    if not entries:
+        print(f"  No entries yet ({store.root / log_name}).")
+    for entry in entries:
+        print(f"  {entry['date']}  {entry['kind']:<10} {entry['subject']}")
     print()
 
 
@@ -261,6 +298,10 @@ def wiki_command(args) -> None:
         _cmd_search(" ".join(getattr(args, "query", []) or []), int(getattr(args, "limit", 6) or 6))
     elif sub == "lint":
         _cmd_lint()
+    elif sub == "catalog":
+        _cmd_catalog()
+    elif sub == "log":
+        _cmd_log(int(getattr(args, "limit", 10) or 10))
     elif sub == "config":
         _cmd_config()
     elif sub == "migrate":
@@ -275,7 +316,8 @@ def wiki_command(args) -> None:
             float(getattr(args, "min_trust", 0.0) or 0.0),
         )
     else:
-        print("\n  Usage: hermes hwiki <status|index|search|lint|migrate|config>\n")
+        print("\n  Usage: hermes hwiki "
+              "<status|index|search|lint|catalog|log|migrate|config>\n")
 
 
 def register_cli(subparser) -> None:
@@ -285,6 +327,10 @@ def register_cli(subparser) -> None:
     subs.add_parser("status", help="Show wiki root, backend and index counts")
     subs.add_parser("index", help="Force a full reindex")
     subs.add_parser("lint", help="Report dangling wikilinks and orphan pages")
+    subs.add_parser("catalog", aliases=["index-md"],
+                    help="Regenerate index.md (page catalog)")
+    log = subs.add_parser("log", help="Show the last entries of log.md")
+    log.add_argument("--limit", type=int, default=10, help="Entries to show (default 10)")
     subs.add_parser("config", help="Show resolved configuration")
 
     search = subs.add_parser("search", help="Search wiki memory")

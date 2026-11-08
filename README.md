@@ -52,6 +52,37 @@ The optional ONNX embedding tier (~25 MB, one-time, fully offline afterwards)
 is set up by `hwiki-extractor`'s `tests/setup_embeddings.sh` recipe or any
 equivalent; without it recall degrades to word-matching, never failing.
 
+## Navigation catalog: `index.md` + `log.md` (v2.1)
+
+The [LLM wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
+keeps two special files beside the pages. hwiki maintains both automatically:
+
+- **`index.md`** — a content catalog at the wiki root: every page as a
+  `[[wikilink]]` with a one-line summary and its `updated` date, grouped by
+  folder, with memory notes listed separately. Regenerated on startup and
+  after every write. Summaries are deterministic (frontmatter
+  `summary`/`description`, else the first prose sentence) — no LLM call, so
+  the catalog cannot silently drift when a model call fails.
+- **`log.md`** — append-only timeline. Every entry is
+  `## [YYYY-MM-DD] kind | subject`, so the history is greppable:
+  `grep "^## \[" log.md | tail -5`.
+
+Both are **derived artifacts**: delete them and nothing is lost. They are
+written to the wiki root, never into `memory_dir` — that zone belongs to
+accepted facts and must not be polluted with generated catalogs. They are
+also held out of the ranking (`demote_paths`), because retrieval here is
+FTS5 + local embeddings: an index-first navigation step would let a page that
+merely *lists* every title outrank the page holding the answer.
+
+Browse them in Obsidian, or from the CLI:
+
+```bash
+hermes hwiki catalog   # regenerate index.md
+hermes hwiki log       # show the last 10 events (--limit N)
+```
+
+`wiki_memory_status` reports both files under a `catalog` key.
+
 ## Recall quality (1.1.0)
 
 - **Stopword hygiene**: personal pronouns/possessives ("user", "my", "their"…) are
