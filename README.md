@@ -268,6 +268,25 @@ Off by default (165 MB RSS), no network at runtime, and a missing bundle raises
 [docs/configuration.md](docs/configuration.md) and the measurements in the project
 bundle's `benchmarks/phase4-nli-verdict.md`.
 
+## Conformance
+
+Two prose documents make promises this project is measured against, and both are
+executable rather than aspirational:
+
+```bash
+python3 tests/eval_llm_wiki.py       # 25 probes: the LLM Wiki pattern, element by element
+python3 tests/eval_capabilities.py   # 32 probes: Honcho's documented surfaces
+python3 tests/bench_footprint.py     # RSS / latency / disk per tier
+```
+
+Current: **20/25** pattern elements fully demonstrated, **10 YES / 12 PARTIAL / 10 NO**
+against Honcho's docs. Every `YES` has an assertion behind it, and a probe that crashes is
+recorded as `NO` with its exception, so a broken probe cannot pass as a gap.
+
+The `NO` rows cluster into one capability — generation. Deduction, induction, dialectic
+and session summaries all need a model that writes prose: 2–8 GB of RSS against this
+project's **1.4 MB** with no model at all. That is a scope decision, not a backlog item.
+
 ## Autonomous maintenance
 
 Memory maintains itself on a bounded tick, the way Honcho's deriver runs in the

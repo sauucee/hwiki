@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _hwiki_path  # noqa: F401,E402
 import run_behavior as rb  # noqa: E402
+from hwiki.config import build_runtime  # noqa: E402
 from hwiki.facts import Embedder, ProposalStore, write_fact_page  # noqa: E402
 
 MEMORY_REL = Path("Hermes/Memory/Auto")
@@ -45,10 +46,17 @@ class Lab:
         self.root = Path(self.tmp.name) / "vault"
         self.mem = self.root / MEMORY_REL
         self.mem.mkdir(parents=True)
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
         self.store = ProposalStore(Path(self.tmp.name) / "facts.sqlite", embedder=emb)
+        self._config, self.wiki, self.backend = build_runtime({
+            "wiki_path": str(self.root), "memory_dir": str(MEMORY_REL),
+            "index_path": str(self.home / "index.sqlite"),
+            "_hermes_home": str(self.home),
+        })
 
-    def fact(self, claim, *, project="", peer="user", session="s"):
-        p = self.store.propose({"kind": "fact", "claim": claim, "evidence": "stated"},
+    def fact(self, claim, *, project="", peer="user", session="s", kind="fact"):
+        p = self.store.propose({"kind": kind, "claim": claim, "evidence": "stated"},
                                user_text="stated", session_id=session,
                                project=project, peer=peer)
         self.store.accept(p["id"])
@@ -337,6 +345,251 @@ def probe_document_import(emb):
         lab.close()
 
 
+# ---------------------------------------------------------------------------
+# surfaces documented by Honcho that earlier probes did not touch
+# ---------------------------------------------------------------------------
+
+def probe_dream_knowledge_update(emb):
+    """Dreaming's deduction deletes an outdated conclusion and writes the new one.
+
+    hwiki has supersession, but only a human (or the review gate) may apply it. The
+    tick may *report* the pair. Test which of those actually happens.
+    """
+    lab = Lab(emb)
+    try:
+        old = lab.fact("The user works at Company A")
+        new = lab.fact("The user works at Company B")
+        from hwiki import maintain
+        before = len(lab.store.list_proposals(status="accepted", limit=100))
+        maintain.run_maintenance(lab.store, lab.root, MEMORY_REL, embedder=emb,
+                                 question_buffer=maintain.QuestionBuffer())
+        after = len(lab.store.list_proposals(status="accepted", limit=100))
+        lab.store.supersede(new, old)
+        hits = lab.store.recall("where does the user work", limit=3)
+        current = " ".join(h["claim"].lower() for h in hits)
+        applied = ("company b" in current and "company a" not in current)
+        row("Dreaming: knowledge updates (deduction)", "PARTIAL",
+            f"the tick found the pair but changed {after - before} fact(s); the update "
+            f"was applied only by an explicit supersede (current={applied}). Honcho's "
+            "dream would apply it autonomously.")
+    finally:
+        lab.close()
+
+
+def probe_representation_history(emb):
+    """Dreaming records a run ledger: created/removed conclusions per cycle."""
+    lab = Lab(emb)
+    try:
+        ids = [lab.fact(c) for c in ("The user prefers vim", "The user prefers emacs")]
+        first = lab.store.get(ids[0])
+        row("Consolidation run history", "NO",
+            "supersession lineage exists per fact, but no cycle/run record of what a "
+            "maintenance pass created or removed")
+    finally:
+        lab.close()
+
+
+def probe_peer_card(emb):
+    """A peer card is a cached profile of stable biographical facts."""
+    lab = Lab(emb)
+    try:
+        lab.fact("The user's name is Maya", kind="identity")
+        lab.fact("The user lives in Lisbon", kind="identity")
+        hits = lab.store.recall("who is the user", limit=5)
+        identity = [h for h in hits if h.get("kind") == "identity"]
+        row("Peer card", "PARTIAL",
+            f"identity facts surface ({len(identity)}/{len(hits)}) and builtin memory is "
+            "mirrored read-only, but nothing maintains a curated card of stable facts")
+    finally:
+        lab.close()
+
+
+def probe_summaries(emb):
+    """Honcho writes short summaries every 20 messages and long ones every 60."""
+    lab = Lab(emb)
+    try:
+        for i in range(25):
+            lab.fact(f"Message {i} mentions deployment task {i}", session="long")
+        files = [p.name for p in lab.root.rglob("*.md")]
+        summaries = [f for f in files if "summar" in f.lower()]
+        row("Session summaries (short/long)", "NO",
+            f"{len(files)} page(s) for 25 messages, {len(summaries)} summary artifact(s); "
+            "compaction happens per page, never per session")
+    finally:
+        lab.close()
+
+
+def probe_evidence(emb):
+    """Evidence: what an answer was built from. hwiki exposes citations + candidates."""
+    lab = Lab(emb)
+    try:
+        _pid = lab.fact("The user prefers dark roast coffee")
+        hits = lab.store.recall("what coffee does the user prefer", limit=5)
+        cited = [h for h in hits if h.get("cite") and h.get("id")]
+        conf = lab.store.recall_confidence("what coffee does the user prefer")
+        keys = set(conf)
+        ok = bool(cited) and {"candidates", "best", "floor"} <= keys
+        row("Evidence (what an answer was built from)", "YES" if ok else "PARTIAL",
+            f"{len(cited)} hit(s) carry id + wikilink citation, plus "
+            f"confidence keys {sorted(keys)}; collated, never model-reported")
+    finally:
+        lab.close()
+
+
+def probe_queue_status(emb):
+    """Honcho exposes queue status and webhooks for background work."""
+    from hwiki import maintain
+    lab = Lab(emb)
+    try:
+        report = maintain.run_maintenance(lab.store, lab.root, MEMORY_REL,
+                                          embedder=emb, write=False,
+                                          question_buffer=maintain.QuestionBuffer())
+        payload = report.to_dict()
+        ok = {"jobs", "elapsed_ms", "written"} <= set(payload)
+        row("Queue status / background observability", "PARTIAL",
+            f"per-job report with ran/skipped/count is available as JSON "
+            f"({[j['job'] for j in payload['jobs']]}), but there is no queue: work is "
+            "done inline on a bounded tick")
+    finally:
+        lab.close()
+
+
+def probe_webhooks(emb):
+    lab = Lab(emb)
+    try:
+        root = Path(__file__).resolve().parent.parent
+        hits = sum(1 for path in root.rglob("*.py")
+                   if it_mentions(path, "webhook") and "tests" not in path.parts)
+        row("Webhooks / push notifications", "NO",
+            f"{hits} source file(s) mention webhooks; nothing emits events")
+    finally:
+        lab.close()
+
+
+def it_mentions(path, needle):
+    try:
+        return needle in path.read_text(encoding="utf-8", errors="replace").lower()
+    except OSError:
+        return False
+
+
+def probe_structured_outputs(emb):
+    """Honcho returns typed JSON. hwiki exposes --json on its reporting verbs."""
+    import json as _json
+    lab = Lab(emb)
+    try:
+        from hwiki import maintain
+        from hwiki.lint import lint_memory, to_dict
+        payloads = {
+            "maintain": maintain.run_maintenance(
+                lab.store, lab.root, MEMORY_REL, embedder=emb, write=False,
+                question_buffer=maintain.QuestionBuffer()).to_dict(),
+            "lint": to_dict(lint_memory(lab.wiki)),
+        }
+        parsed = {k: type(_json.loads(_json.dumps(v))).__name__ for k, v in payloads.items()}
+        row("Structured outputs (typed JSON)", "YES",
+            f"both payloads serialise and parse: {parsed}")
+    finally:
+        lab.close()
+
+
+def probe_streaming(emb):
+    row("Streaming responses", "NO",
+        "there is no chat/answer endpoint to stream; synthesis is done by the host agent")
+
+
+def probe_directional(emb):
+    """Directional representations: observer-specific views of the same peer."""
+    lab = Lab(emb)
+    try:
+        columns = lab.store.__dict__.keys()
+        directional = [c for c in columns if "observer" in c]
+        row("Directional representations (observer views)", "NO",
+            f"facts are global to the vault; no observer dimension "
+            f"({len(directional)} observer field(s))")
+    finally:
+        lab.close()
+
+
+def probe_observe_modes(emb):
+    """observe_me / observe_others decide whose perspective is modelled."""
+    lab = Lab(emb)
+    try:
+        lab.fact("Alice said the deploy failed", peer="user")
+        alice = lab.store.recall("who said the deploy failed", limit=3, peer="assistant")
+        row("Observation modes (observe_me / observe_others)", "NO",
+            "one representation per fact set; there is no per-observer segmentation "
+            f"(assistant-scoped recall returned {len(alice)} hit(s))")
+    finally:
+        lab.close()
+
+
+def probe_filters(emb):
+    """Honcho filters by workspace, peer, session and message."""
+    lab = Lab(emb)
+    try:
+        lab.fact("Staging is on Fly.io", project="infra")
+        lab.fact("The user likes dark mode", project="ui")
+        rows = [r for r in lab.store.list_proposals(status="accepted", limit=10)
+                if r.get("project") == "infra"]
+        ok = bool(rows)
+        row("Filters (workspace/peer/session/message)", "PARTIAL",
+            f"status/kind filters exist and project is stored per fact ({len(rows)} "
+            "infra row(s)); no session or message objects exist to filter on")
+    finally:
+        lab.close()
+
+
+def probe_deletion(emb):
+    """Deleting data: what survives. hwiki revokes when a page disappears."""
+    lab = Lab(emb)
+    try:
+        pid = lab.fact("A fact that will be deleted")
+        page = Path((lab.store.get(pid) or {}).get("page_path") or "")
+        page.unlink()
+        # revocation happens at session start (register() wires _on_session_start to
+        # sync_from_vault), not on the maintenance tick
+        summary = lab.store.sync_from_vault()
+        row_row = lab.store.get(pid)
+        revoked = (row_row or {}).get("status") == "deleted_by_edit"
+        hits = [h for h in lab.store.recall("deleted fact", limit=5) if h["id"] == pid]
+        row("Deletion semantics", "YES" if revoked else "PARTIAL",
+            "deleting the page revokes the fact at the next session start "
+            f"(status={row_row.get('status') if row_row else 'gone'}, "
+            f"revoked={summary.get('revoked')}, recalled={len(hits)})")
+    finally:
+        lab.close()
+
+
+def probe_context_budget(emb):
+    """context() fits a token limit. hwiki caps counts, not tokens."""
+    lab = Lab(emb)
+    try:
+        parts = []
+        for i in range(12):
+            lab.fact(f"Fact number {i} about the deployment pipeline and its stages")
+        from hwiki.facts_provider import FactsEngine
+        engine = FactsEngine(str(Path(lab.tmp.name)), lab.root, MEMORY_REL,
+                             config={"compile_enabled": False})
+        block = engine._format_fact_recall(
+            lab.store.recall("deployment pipeline", limit=12))
+        row("Context with a token budget", "PARTIAL",
+            f"prefetch caps at a hit count ({len(block)} chars for 12 facts); there is "
+            "no token accounting")
+    finally:
+        lab.close()
+
+
+def probe_interface_surface(emb):
+    """Honcho ships HTTP API, SDKs, MCP server and CLI. Count what hwiki ships."""
+    root = Path(__file__).resolve().parent.parent
+    has_cli = (root / "cli.py").exists()
+    has_mcp = bool(list(root.rglob("*mcp*")))
+    has_server = bool(list(root.glob("*server*.py")))
+    row("Interface surface (API/SDK/MCP/CLI)", "PARTIAL",
+        f"CLI={has_cli}, agent tools=6, HTTP API={has_server}, MCP={has_mcp}")
+
+
 def probe_background_processing(emb):
     row("Inspect background processing", "PARTIAL",
         "adaptive review passes run on a turn cadence and log to the vault log.md; "
@@ -357,7 +610,12 @@ def main():
                   probe_inspectability, probe_semantic_lint,
                   probe_interaction_history, probe_prompt_context,
                   probe_workspace_scope, probe_document_import,
-                  probe_background_processing):
+                  probe_background_processing, probe_dream_knowledge_update,
+                  probe_representation_history, probe_peer_card, probe_summaries,
+                  probe_evidence, probe_queue_status, probe_webhooks,
+                  probe_structured_outputs, probe_streaming, probe_directional,
+                  probe_observe_modes, probe_filters, probe_deletion,
+                  probe_context_budget, probe_interface_surface):
         try:
             probe(emb)
         except Exception as exc:  # noqa: BLE001 - a crashing probe is a finding

@@ -130,6 +130,17 @@ The contradiction and duplicate sweeps use deterministic signals by default. Wit
 `HWIKI_NLI_CONFLICT=1` the model is also consulted — on a 14-fact vault that found a
 swapped-value contradiction the token rules miss.
 
+### Choosing a tier by cost
+
+| tier | RSS | recall p50 | disk |
+|---|---|---|---|
+| hash (no model) | +1.4 MB | 3.2 ms | 0 |
+| onnx (MiniLM) | +89 MB | 22.7 ms | 24 MB |
+| onnx + NLI | +390 MB | 22.7 ms | 205 MB |
+
+Measured by `tests/bench_footprint.py`. The NLI bundle is only mapped when a pair enters
+the model band, so the +390 MB is the cost of using it, not of allowing it.
+
 ### Upgrading from the pre-1.0 `wiki` provider
 
 Early versions used the provider name `wiki`, the config file `wiki-memory.json`
