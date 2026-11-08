@@ -283,6 +283,11 @@ Current: **21/25** pattern elements fully demonstrated, **11 YES / 11 PARTIAL / 
 against Honcho's docs. Every `YES` has an assertion behind it, and a probe that crashes is
 recorded as `NO` with its exception, so a broken probe cannot pass as a gap.
 
+hwiki has no *document* concept: memory is built from conversation turns, so the pattern's
+"summary page per source document" has nothing to summarise (session diaries cover the
+per-session half). That is a deliberate scope statement, with the entry point recorded in
+`docs/wiki-schema.md`.
+
 The `NO` rows cluster into one capability — generation. Deduction, induction, dialectic
 and session summaries all need a model that writes prose: 2–8 GB of RSS against this
 project's **1.4 MB** with no model at all. That is a scope decision, not a backlog item.

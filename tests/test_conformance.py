@@ -178,8 +178,8 @@ class ConformanceKeys(unittest.TestCase):
         for element in DOCUMENTED_GAPS:
             self.assertEqual(self.honcho.get(element), "NO",
                              f"{element} is now YES — update benchmarks/conformance-2026-11.md")
-        # the pattern's remaining honest NOs
-        self.assertEqual(self.pattern.get("Per-source summary pages"), "NO")
+        # per-session diaries exist; per-document summaries do not (no source documents)
+        self.assertEqual(self.pattern.get("Per-source summary pages"), "PARTIAL")
         self.assertEqual(self.pattern.get("Evolving prose synthesis"), "NO")
 
 

@@ -242,6 +242,22 @@ hypothesis, and entailment(question, claim) measured zero signal. Do not rebuild
 Failure mode is explicit: a missing bundle raises `NliUnavailable`, callers keep the
 previous behaviour, and nothing is guessed.
 
+### Per-document ingestion (not built)
+
+The LLM Wiki pattern assumes a **source document** layer: drop an article in `raw/`, have
+the LLM write a page about it and file the facts it took from it. hwiki has no document
+concept — memory is built from conversation turns — so there is nothing to summarise and
+nothing to link back to.
+
+What exists instead: `write_session_diary()` writes `session-<date>-<sid>.md` at session
+finalize, listing the facts that session captured. That is the per-*session* half of the
+pattern.
+
+Entry point, if documents ever become part of the workflow: `plan.py` already plans an
+ingest from a vault file and writes nothing; a document page would be written after the
+same review gate as any claim, then linked from the claims it produced. Deliberately not
+built while no documents exist — a page per turn or per session would be permanent noise.
+
 ### Lint checks
 
 `hermes hwiki lint [--semantic] [--info]` reports, in one read-only pass: missing

@@ -34,7 +34,7 @@ import run_behavior as rb  # noqa: E402
 from hwiki import catalog, compile as compile_mod, lint, maintain  # noqa: E402
 from hwiki.config import build_runtime  # noqa: E402
 from hwiki.facts import (Embedder, ProposalStore, file_answer,  # noqa: E402
-                         write_fact_page)
+                         write_fact_page, write_session_diary)
 
 MEMORY_REL = Path("Hermes/Memory/Auto")
 ROWS = []
@@ -500,17 +500,36 @@ def probe_compounding(emb):
 # ---------------------------------------------------------------------------
 
 def probe_session_summaries(emb):
-    """The pattern's ingest writes a summary page per source. hwiki writes per claim."""
+    """The pattern writes a summary page per *source document*.
+
+    hwiki has the per-session half of that (a diary page listing what a session
+    contributed) but no document concept: nothing in the vault is a "source" to summarise.
+    Both halves are asserted so the verdict cannot drift with the prose.
+    """
     lab = Lab(emb)
     try:
         lab.raw_source("article.md", "# Article\n\nThree facts about staging.\n")
         lab.fact("Staging server stays on Fly.io")
         lab.fact("Staging uses the EU region")
-        summaries = [p for p in lab.mem.glob("*.md")
-                     if "summary" in p.stem or "article" in p.stem]
-        row("Per-source summary pages", "NO",
-            f"{len(summaries)} summary page(s) for 1 source; hwiki files one page per "
-            "claim and summarises only inside index.md")
+        diary = write_session_diary(
+            lab.root, MEMORY_REL, "session-a3f19c",
+            "Discussed where staging runs.",
+            ["Staging server stays on Fly.io", "Staging uses the EU region"],
+            ["staging", "deploys"])
+        diary_text = diary.read_text(encoding="utf-8") if diary else ""
+        lists_facts = diary is not None and "Facts captured" in diary_text
+        document_pages = [p for p in lab.mem.glob("*.md")
+                          if "article" in p.stem or "summar" in p.stem]
+        if lists_facts and not document_pages:
+            row("Per-source summary pages", "PARTIAL",
+                "per-session diary exists and lists the facts it captured "
+                f"({diary.name}); per-document summaries do not — nothing in the vault is "
+                "a source document to summarise")
+        elif lists_facts:
+            row("Per-source summary pages", "YES",
+                f"session diary plus {len(document_pages)} document page(s)")
+        else:
+            row("Per-source summary pages", "NO", "no summary page per session or source")
     finally:
         lab.close()
 
