@@ -526,6 +526,18 @@ def _frontmatter_dict(page_text: str) -> Dict[str, str]:
     return out
 
 
+def _one_line(value: Any, limit: int = 0) -> str:
+    """Single-line, injection-proof text for frontmatter and headings.
+
+    Claims, evidence, peers and session ids come from a model or from the CLI. An embedded
+    newline in any of them used to open a second frontmatter block, so a claim beginning
+    with ``---`` could forge ``status: accepted`` or point ``peer`` at someone else. Collapse
+    whitespace at the boundary instead of trusting the caller.
+    """
+    text = " ".join(str(value or "").replace("\x00", " ").split())
+    return text[:limit] if limit else text
+
+
 def write_fact_page(vault_root: Path, memory_rel: Path, proposal: Dict[str, Any],
                     supersedes_claim: str = "") -> Path:
     """Write one Obsidian note per accepted fact; returns the page path."""
@@ -538,17 +550,17 @@ def write_fact_page(vault_root: Path, memory_rel: Path, proposal: Dict[str, Any]
     tags = {"memory/auto", str(proposal.get("kind") or "fact")}
     lines = [
         "---",
-        f"title: {proposal['claim'][:80]}",
+        f"title: {_one_line(proposal['claim'], 80)}",
         "spine: memory",
         "type: memory",
         "status: auto",
         FACT_MARKER,
         f"proposal_id: {proposal['id']}",
-        f"kind: {proposal.get('kind', 'fact')}",
-        f"peer: {proposal.get('peer') or 'user'}",
-        f"project: {proposal.get('project', '')}",
+        f"kind: {_one_line(proposal.get('kind', 'fact')) or 'fact'}",
+        f"peer: {_one_line(proposal.get('peer')) or 'user'}",
+        f"project: {_one_line(proposal.get('project'))}",
         f"accepted_at: {accepted_iso}",
-        f"tags: [{', '.join(sorted(tags))}]",
+        f"tags: [{', '.join(sorted(_one_line(t).replace(',', ' ') for t in tags))}]",
     ]
     if supersedes_claim:
         lines.append(f"supersedes: \"[[{slug_for_claim(supersedes_claim)}]]\"")
@@ -558,11 +570,11 @@ def write_fact_page(vault_root: Path, memory_rel: Path, proposal: Dict[str, Any]
     lines += [
         "---",
         "",
-        f"# {proposal['claim']}",
+        f"# {_one_line(proposal['claim'])}",
         "",
-        f"> **Evidence:** {proposal.get('evidence', '')}",
+        f"> **Evidence:** {_one_line(proposal.get('evidence', ''))}",
         "",
-        f"*Accepted {accepted_iso} · session `{proposal.get('session_id', '')}` · via hwiki-extractor.*",
+        f"*Accepted {accepted_iso} · session `{_one_line(proposal.get('session_id', ''))}` · via hwiki-extractor.*",
         "",
     ]
     page.write_text("\n".join(lines), encoding="utf-8")
@@ -855,7 +867,7 @@ def write_session_diary(vault_root: Path, memory_rel: Path, session_id: str,
         "type: memory",
         "status: auto",
         FACT_MARKER,
-        f"session_id: {session_id}",
+        f"session_id: {_one_line(session_id)}",
         "tags: [memory/auto, session-diary]",
         "---",
         "",
@@ -865,10 +877,10 @@ def write_session_diary(vault_root: Path, memory_rel: Path, session_id: str,
     if summary:
         lines += [summary, ""]
     if topics:
-        lines += ["**Topics:** " + ", ".join(list(topics)[:8]), ""]
+        lines += ["**Topics:** " + ", ".join(_one_line(t) for t in list(topics)[:8]), ""]
     if facts:
         lines += ["**Facts captured:**"]
-        lines += [f"- {f}" for f in list(facts)[:10]]
+        lines += [f"- {_one_line(f)}" for f in list(facts)[:10]]
         lines.append("")
     page.write_text("\n".join(lines), encoding="utf-8")
     return page
@@ -1430,6 +1442,14 @@ class ProposalStore:
         field means the honest answer is "nothing relevant", never the
         least-bad guess.
         """
+        # Hostile-but-easy arguments are normalised here, not trusted: ``None`` used to
+        # raise from inside a regex and negative limits were passed to SQLite, where
+        # LIMIT -1 means "no limit" — quietly ignoring the caller's cap.
+        query = " ".join(str(query or "").split())
+        try:
+            limit = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
+            limit = 8
         query_vec = self.embedder.embed(query)
         query_toks = set(_tokens(query))
         temporal_intent = bool(query_toks & _TEMPORAL_TOKENS)
@@ -1608,7 +1628,7 @@ def file_answer(memory_root: Path, question: str, answer: str,
             ),
         }
 
-    tag_list = [str(t).strip() for t in (tags or []) if str(t).strip()]
+    tag_list = [_one_line(t).replace(",", " ") for t in (tags or []) if _one_line(t)]
     answers_dir = Path(memory_root) / ANSWERS_SUBDIR
     slug = slugify(question, fallback="answer")
     target = answers_dir / f"{slug}.md"

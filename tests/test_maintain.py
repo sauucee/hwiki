@@ -672,3 +672,24 @@ class DryRunWritesNothingTests(unittest.TestCase):
             "- [[gone-page]]\n", encoding="utf-8")
         self._tick(write=True)
         self.assertNotIn("gone-page", index.read_text(encoding="utf-8"))
+
+
+class ClockSkewTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = ProposalStore(Path(self._tmp.name) / "f.sqlite",
+                                  embedder=Embedder(mode="hash"))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_future_timestamp_does_not_disable_the_tick(self):
+        """A clock that jumped forward once must not wedge maintenance until 2099."""
+        self.store.set_meta(maintain.META_LAST_RUN, "2099-01-01T00:00:00+00:00")
+        self.assertTrue(maintain.due(self.store, {}))
+
+    def test_a_recent_timestamp_is_still_not_due(self):
+        from datetime import datetime, timezone
+        self.store.set_meta(maintain.META_LAST_RUN,
+                            datetime.now(timezone.utc).isoformat())
+        self.assertFalse(maintain.due(self.store, {}))

@@ -38,12 +38,15 @@ cannot stall a conversation.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 MAINTENANCE_FILENAME = "maintenance.md"
 META_LAST_RUN = "maintenance_last_run"
@@ -644,4 +647,10 @@ def due(store, config: Optional[Dict[str, Any]] = None,
     except ValueError:
         return True
     current = now or datetime.now(timezone.utc)
-    return (current - then).total_seconds() >= hours * 3600
+    elapsed = (current - then).total_seconds()
+    if elapsed < -3600:
+        # A timestamp more than an hour in the future means the clock moved (or the value
+        # was written wrong). Trusting it would disable maintenance until 2099.
+        logger.info("hwiki: maintenance timestamp is in the future (%s); running now", last)
+        return True
+    return elapsed >= hours * 3600

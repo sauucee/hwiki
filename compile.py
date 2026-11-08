@@ -178,6 +178,22 @@ def choose_owner(candidates: Sequence[Dict[str, Any]],
     return eligible[0]
 
 
+_SUPERSEDED_RE = re.compile(r"^status:\s*superseded\s*$", re.M)
+_DERIVED_TYPE_RE = re.compile(r"^type:\s*(maintenance|log|index)\s*$", re.M)
+_DERIVED_STATUS_RE = re.compile(r"^status:\s*generated\s*$", re.M)
+
+
+def _merge_refusal(page_path: Path, text: str) -> str:
+    """Why this page must not receive a compiled claim, or "" when it may."""
+    if _SUPERSEDED_RE.search(text):
+        return "owner page is superseded"
+    if _DERIVED_TYPE_RE.search(text) or _DERIVED_STATUS_RE.search(text):
+        return "owner page is a generated artifact"
+    if page_path.parent.name == "answers":
+        return "owner page is a filed answer"
+    return ""
+
+
 def merge_into_page(page_path: Path, claim: str, *, evidence: str = "",
                     kind: str = "fact", accepted_iso: str = "",
                     proposal_id: str = "", peer: str = "user",
@@ -193,6 +209,14 @@ def merge_into_page(page_path: Path, claim: str, *, evidence: str = "",
     except OSError as exc:
         return CompileResult(merged=False, page=None,
                              reason=f"owner page unreadable: {exc}")
+
+    # Never add to a page that is no longer current, and never to a file hwiki derived:
+    # merging into a superseded tombstone would make the "one current claim" invariant
+    # false, and merging into maintenance.md / a filed answer would edit a generated
+    # artifact that search deliberately excludes.
+    refusal = _merge_refusal(page_path, text)
+    if refusal:
+        return CompileResult(merged=False, page=str(page_path), reason=refusal)
 
     normalized = _one_line(claim, _MAX_CLAIM).lower()
     seen = {s.lower() for s in existing_sections(text)}

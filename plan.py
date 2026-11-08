@@ -139,9 +139,13 @@ def build_plan(store, claims: Sequence[str], *, source: str = "",
     """Predict the lifecycle for each claim. Reads the store; writes nothing."""
     from .facts import _secret_formed  # local: keep module import surface small
 
+    # ``store`` is documented as the facts store, but ``embedder`` is not part of the
+    # read API every caller has (a WikiStore has none), and this line used to raise
+    # AttributeError instead of planning. Report the tier only when it is knowable.
+    embedder = getattr(store, "embedder", None)
     plan = Plan(source=source,
-                tier="onnx-minilm" if getattr(store.embedder, "_onnx", None) is not None
-                else "hash")
+                tier=("onnx-minilm"
+                      if getattr(embedder, "_onnx", None) is not None else "hash"))
     existing = []
     # list_proposals is paged (default 20); a plan must see every accepted fact or
     # it would invent an owner that already exists.

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import _hwiki_path  # noqa: F401,E402
 
+from hwiki import compile as compile_mod  # noqa: E402
 from hwiki.compile import (  # noqa: E402
     MERGE_SIMILARITY,
     SECTION_END,
@@ -180,3 +181,52 @@ class MergeIntoPageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class MergeRefusalTests(unittest.TestCase):
+    """Compile must not add to a page that is no longer current, or to a derived file."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.mem = self.root / "mem"
+        self.mem.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _page(self, name, frontmatter, body="# Page\n\nclaim text\n"):
+        path = self.mem / name
+        path.write_text(f"---\n{frontmatter}\n---\n\n{body}", encoding="utf-8")
+        return path
+
+    def test_a_superseded_page_is_not_merged_into(self):
+        page = self._page("old.md", "title: Old\ntype: memory\nstatus: superseded")
+        before = page.read_text(encoding="utf-8")
+        result = compile_mod.merge_into_page(page, "a newer claim", proposal_id="p1")
+        self.assertFalse(result.merged)
+        self.assertIn("superseded", result.reason)
+        self.assertEqual(page.read_text(encoding="utf-8"), before)
+
+    def test_the_maintenance_report_is_not_merged_into(self):
+        page = self._page("maintenance.md",
+                          "title: Memory maintenance\ntype: maintenance\nstatus: generated")
+        before = page.read_text(encoding="utf-8")
+        result = compile_mod.merge_into_page(page, "a claim", proposal_id="p1")
+        self.assertFalse(result.merged)
+        self.assertIn("generated", result.reason)
+        self.assertEqual(page.read_text(encoding="utf-8"), before)
+
+    def test_a_filed_answer_is_not_merged_into(self):
+        answers = self.mem / "answers"
+        answers.mkdir()
+        page = answers / "answer.md"
+        page.write_text("---\ntitle: Answer\n---\n\n# Answer\n\ntext\n", encoding="utf-8")
+        result = compile_mod.merge_into_page(page, "a claim", proposal_id="p1")
+        self.assertFalse(result.merged)
+        self.assertIn("filed answer", result.reason)
+
+    def test_an_ordinary_fact_page_still_merges(self):
+        page = self._page("fact.md", "title: Fact\ntype: memory\nstatus: auto")
+        result = compile_mod.merge_into_page(page, "a second claim", proposal_id="p1")
+        self.assertTrue(result.merged, result.reason)

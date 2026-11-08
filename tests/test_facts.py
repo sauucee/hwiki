@@ -441,6 +441,29 @@ class EmbeddingTests(unittest.TestCase):
         self.assertEqual(len(vec), 2048 * 4)
 
 
+class RecallArgumentTests(unittest.TestCase):
+    """Recall is the read path: odd arguments must degrade, never raise."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = ProposalStore(Path(self._tmp.name) / "f.sqlite",
+                                   embedder=Embedder(mode="hash"))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_none_query_returns_no_hits(self):
+        self.assertEqual(self.store.recall(None), [])
+
+    def test_negative_limit_is_clamped_not_passed_to_sqlite(self):
+        """SQLite reads LIMIT -1 as "no limit", which silently ignores the caller's cap."""
+        for limit in (-1, 0, -100):
+            self.assertEqual(self.store.recall("anything", limit=limit), [])
+
+    def test_a_huge_limit_is_clamped(self):
+        self.assertIsInstance(self.store.recall("anything", limit=10 ** 9), list)
+
+
 class EmbeddingCacheTests(unittest.TestCase):
     """A repeated query must not be re-embedded — but never a *different* query."""
 
