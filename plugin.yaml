@@ -12,12 +12,9 @@ requires_hermes: ">=0.21"
 # Standard library only. PyYAML (shipped with Hermes) is used opportunistically for frontmatter.
 pip_dependencies: []
 
-# Optional, only for backend = "qmd". The setup wizard prints the hint when the binary is
-# missing and the provider falls back to FTS5.
-external_dependencies:
-  - name: qmd
-    check: "qmd --version"
-    install: "npm install -g @tobilu/qmd   # requires Node.js >= 22"
+# QMD is optional (backend = "qmd"); when absent, hwiki falls back to FTS5.
+# Do not list it under external_dependencies: Hermes treats those as required
+# for readiness. Optional install: npm install -g @tobilu/qmd (Node.js >= 22).
 
 # All tools (wiki + facts) are served through MemoryProvider.get_tool_schemas();
 # the plugin-level hooks below drive the fact extraction/review write path.
