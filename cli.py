@@ -283,9 +283,9 @@ def _cmd_lint(as_json: bool = False, show_info: bool = False,
         print(json.dumps(to_dict(report), indent=2, ensure_ascii=False))
         return
     dangling = store.dangling_links()
-    _out, backlinks = store.link_graph()
-    orphans = [p.slug for p in store.iter_pages()
-               if not backlinks.get(p.slug) and p.slug != "index"]
+    _out, backlinks = store.link_graph(key="path")
+    orphans = [p.path for p in store.iter_pages()
+               if not backlinks.get(p.path) and p.path != "index.md"]
     counts = report.counts()
     print("\nWiki lint\n" + "-" * 46)
     print(f"  Memory pages checked: {report.pages_checked}")

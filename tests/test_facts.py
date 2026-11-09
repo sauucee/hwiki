@@ -658,9 +658,6 @@ class VaultTests(unittest.TestCase):
         self.assertEqual({e['target'] for e in entries}, {'user'})
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class GuardrailsAndUsageTests(unittest.TestCase):
     def setUp(self):
@@ -835,3 +832,7 @@ class V25Tests(unittest.TestCase):
             builtin_entries=[{'text': long_entry, 'target': 'user'}])
         print('DEBUG dup:', repr(proposal['duplicate_of_builtin'])[:60], file=_s.stderr)
         self.assertTrue(proposal['duplicate_of_builtin'])
+
+
+if __name__ == '__main__':
+    unittest.main()

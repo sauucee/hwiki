@@ -161,7 +161,11 @@ def main() -> int:
               repr(res.get("frontmatter")))
         check("read exposes links", "mistral-models" in res["links"], repr(res.get("links")))
         res_bl = json.loads(provider.handle_tool_call("wiki_memory_read", {"page": "mistral-models"}))
-        check("read exposes backlinks", "le-chonk" in res_bl["backlinks"], repr(res_bl.get("backlinks")))
+        check("read exposes backlink_paths by path",
+              "wiki/concepts/le-chonk.md" in res_bl["backlink_paths"],
+              repr(res_bl.get("backlink_paths")))
+        check("read keeps slug backlinks",
+              "le-chonk" in res_bl["backlinks"], repr(res_bl.get("backlinks")))
 
         print("\n[5] untrusted zone is unreachable")
         res = json.loads(provider.handle_tool_call(

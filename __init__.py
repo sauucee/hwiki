@@ -70,6 +70,11 @@ except Exception as _catalog_exc:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+#: Version of the tool payload contract. Bumped only for *additive* changes: fields
+#: that exist keep their name and shape, new exact views arrive beside the old ones,
+#: so a consumer reading the old field is never silently re-keyed.
+CONTRACT_VERSION = 2
+
 __all__ = [
     "WikiMemoryProvider", "register", "load_config", "build_runtime",
     "CONFIG_FILENAME", "DEFAULTS",
@@ -116,8 +121,10 @@ WIKI_READ_SCHEMA = {
     "name": "wiki_memory_read",
     "description": (
         "Read a wiki page in full by path, slug, or [[wikilink]] name. Also "
-        "returns the page's frontmatter, outbound links and backlinks so you "
-        "can traverse the knowledge graph."
+        "returns the page's frontmatter, outbound links (raw wikilink targets), "
+        "backlinks (slugs of the pages linking here, the historical field) and "
+        "backlink_paths (their exact paths, which never merge two pages that share "
+        "a filename) so you can traverse the knowledge graph."
     ),
     "parameters": {
         "type": "object",
@@ -898,14 +905,20 @@ class WikiMemoryProvider(MemoryProvider):
         max_chars = max(200, min(int(args.get("max_chars") or 8000), 40000))
         body = page.body
         truncated = len(body) > max_chars
-        _, backlinks = self._store.link_graph()
+        # ``backlinks`` keeps its historical slug values (a consumer or a prompt may
+        # read it positionally); the exact per-page list is the additive
+        # ``backlink_paths``, because a slug key merges two pages sharing a filename.
+        _, backlinks_by_slug = self._store.link_graph()
+        _, backlinks_by_path = self._store.link_graph(key="path")
         return json.dumps({
             "success": True,
+            "contract_version": CONTRACT_VERSION,
             "path": page.path,
             "title": page.title,
             "frontmatter": {k: v for k, v in page.frontmatter.items()},
             "links": page.links(),
-            "backlinks": sorted(set(backlinks.get(page.slug, []))),
+            "backlinks": sorted(set(backlinks_by_slug.get(page.slug, []))),
+            "backlink_paths": sorted(set(backlinks_by_path.get(page.path, []))),
             "truncated": truncated,
             "content": body[:max_chars],
         }, ensure_ascii=False, default=str)
@@ -1018,16 +1031,30 @@ class WikiMemoryProvider(MemoryProvider):
             "writes_this_session": self._writes_this_session,
         }
         if args.get("lint"):
+            # old fields keep old shapes; the path-exact views are additive
+            pages = list(self._store.iter_pages())
             dangling = self._store.dangling_links()
-            _out, backlinks = self._store.link_graph()
-            orphans = sorted(
-                page.slug for page in self._store.iter_pages()
-                if not backlinks.get(page.slug) and page.slug != "index"
+            _out, by_slug = self._store.link_graph()
+            _out, by_path = self._store.link_graph(key="path")
+            orphan_paths = sorted(
+                page.path for page in pages
+                if not by_path.get(page.path) and page.path != "index.md"
             )
+            orphans = sorted({
+                page.slug for page in pages
+                if not by_slug.get(page.slug) and page.path != "index.md"
+            })
             payload["lint"] = {
+                "contract_version": CONTRACT_VERSION,
                 "dangling_links": dangling,
+                "dangling_link_paths": self._store.dangling_links(key="path"),
                 "orphan_pages": orphans[:50],
+                "orphan_page_paths": orphan_paths[:50],
+                # ``orphan_count`` stays the length of the slug list it has always
+                # described; the exact count arrives separately so the two can never
+                # drift apart again (a slug list is shorter than a path list for twins)
                 "orphan_count": len(orphans),
+                "orphan_path_count": len(orphan_paths),
             }
         if self._catalog_enabled and CATALOG_AVAILABLE and self._store is not None:
             entries: List[Dict[str, str]] = []

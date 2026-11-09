@@ -179,9 +179,6 @@ class MergeIntoPageTests(unittest.TestCase):
                       self.page.read_text(encoding="utf-8"))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 class MergeRefusalTests(unittest.TestCase):
     """Compile must not add to a page that is no longer current, or to a derived file."""
@@ -230,3 +227,7 @@ class MergeRefusalTests(unittest.TestCase):
         page = self._page("fact.md", "title: Fact\ntype: memory\nstatus: auto")
         result = compile_mod.merge_into_page(page, "a second claim", proposal_id="p1")
         self.assertTrue(result.merged, result.reason)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

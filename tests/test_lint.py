@@ -16,6 +16,7 @@ from pathlib import Path
 import _hwiki_path  # noqa: F401,E402
 
 from hwiki.facts import Embedder, ProposalStore, write_fact_page  # noqa: E402
+from hwiki import lint  # noqa: E402
 from hwiki.lint import lint_memory, format_report, to_dict, ERROR, WARN  # noqa: E402
 from hwiki.store import WikiStore  # noqa: E402
 
@@ -46,6 +47,24 @@ class LintTests(unittest.TestCase):
         page = write_fact_page(self.root, MEMORY_REL, self.facts.get(p["id"]))
         self.facts.set_page_path(p["id"], page)
         return Path(page)
+
+    def test_a_folder_qualified_catalog_entry_counts_as_navigation(self):
+        """A memory note whose stem is duplicated elsewhere is still catalogued.
+
+        The catalog names the folder for duplicate stems, so counting a catalog
+        entry as an inbound route has to resolve the same way.
+        """
+        curated = self.root / "Hermes" / "fact.md"
+        curated.parent.mkdir(parents=True, exist_ok=True)
+        curated.write_text("# fact\n\nA curated page that shares the stem.\n",
+                           encoding="utf-8")
+        (self.root / "index.md").write_text(
+            "# Index\n\n- [[Hermes/fact|fact]]\n- [[Hermes/Decisions|Decisions]]\n"
+            "- [[Projects/Alpha/Decisions|Decisions]]\n"
+            f"- [[{MEMORY_REL.as_posix()}/fact|fact]]\n", encoding="utf-8")
+        report = lint_memory(self.store)
+        orphans = [f.line for f in report.findings if f.check == "link.orphan"]
+        self.assertEqual(orphans, [])
 
     def checks(self, report):
         return [(f.check, f.severity) for f in report.findings]
@@ -157,6 +176,65 @@ class LintTests(unittest.TestCase):
         self.assertIn(("catalog.entry_missing", WARN), checks)
         self.assertIn(("catalog.stale", WARN), checks)
 
+    def curated_page(self, rel="Projects/Alpha/Current State.md",
+                     body="The deploy is on hold.\n"):
+        """A hand-written page outside the memory zone."""
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def generated_index(self):
+        """Write the index exactly as the catalog renders it (one ``[[stem]]``/page)."""
+        from hwiki.catalog import build_index
+        text = build_index(self.store, memory_dir=MEMORY_REL.as_posix())
+        (self.root / "index.md").write_text(text, encoding="utf-8")
+        return text
+
+    def test_catalog_covers_the_whole_vault_not_only_the_memory_zone(self):
+        """The catalog lists every page, so no curated page is 'stale'.
+
+        Judging index.md against the memory zone alone reported each curated page as
+        gone on every run while the page sat on disk — the false positive that trains
+        a reader to ignore lint.
+        """
+        self.fact_page("User prefers terse status updates")
+        self.curated_page("Projects/Alpha/Current State.md",
+                          "---\ntitle: Current State\n---\n\nThe deploy is on hold.\n")
+        self.curated_page("Projects/Alpha/Tasks.md", "# Tasks\n\nNothing yet.\n")
+        self.generated_index()
+
+        report = lint_memory(self.store)
+        catalog_checks = [(f.check, f.page, f.detail) for f in report.findings
+                          if f.check.startswith("catalog.")]
+        self.assertEqual(catalog_checks, [], catalog_checks)
+
+    def test_catalog_still_flags_a_page_that_is_gone(self):
+        """Real rot survives the fix: one missing page, one finding naming it."""
+        self.fact_page("User prefers terse status updates")
+        self.curated_page()
+        index = self.generated_index()
+        (self.root / "index.md").write_text(
+            index + "\n- [[ghost-page]]\n", encoding="utf-8")
+
+        report = lint_memory(self.store)
+        stale = [f for f in report.findings if f.check == "catalog.stale"]
+        self.assertEqual(len(stale), 1, [f.line for f in report.findings])
+        self.assertIn("ghost-page", stale[0].detail)
+
+    def test_catalog_missing_a_curated_page_is_flagged(self):
+        """A page that exists but is not in the catalog is rot too."""
+        page = self.fact_page("User prefers terse status updates")
+        self.curated_page()
+        (self.root / "index.md").write_text(
+            f"# Index\n\n- [[{page.stem}]]\n", encoding="utf-8")
+
+        report = lint_memory(self.store)
+        missing = [f for f in report.findings if f.check == "catalog.entry_missing"]
+        self.assertEqual(len(missing), 1, [f.line for f in report.findings])
+        self.assertIn("current state", missing[0].detail.lower())
+        self.assertEqual([f for f in report.findings if f.check == "catalog.stale"], [])
+
     # -- reporting -------------------------------------------------------
 
     def test_report_dict_is_machine_readable(self):
@@ -184,9 +262,6 @@ class LintTests(unittest.TestCase):
         self.assertEqual(report.pages_checked, 0)
         self.assertTrue(report.ok)
 
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class OrphanTests(LintTests):
@@ -224,6 +299,22 @@ class OrphanTests(LintTests):
         orphans = [f for f in report.findings if f.check == "link.orphan"]
         self.assertEqual([o.page for o in orphans if "maintenance" in o.page], [])
 
+    def test_a_curated_page_linking_a_note_counts_as_inbound(self):
+        """Navigation crosses zones: only memory-zone pages were read as sources.
+
+        A hand-written page under ``Hermes/`` that links a memory note is a real
+        inbound route; the note was still reported as an orphan because the inbound
+        pass read only the memory zone it was reporting on.
+        """
+        target = self._note("target", "Linked from a curated page.\n")
+        curated = self.root / "Hermes" / "Home.md"
+        curated.parent.mkdir(parents=True, exist_ok=True)
+        curated.write_text(f"# Home\n\nSee [[{target.stem}]].\n", encoding="utf-8")
+        report = lint_memory(self.store)
+        orphans = [f for f in report.findings if f.check == "link.orphan"]
+        self.assertNotIn(str(target.relative_to(self.root)), [f.page for f in orphans],
+                         [f.line for f in orphans])
+
     def test_it_is_info_not_a_warning(self):
         self._note("quiet", "Nothing links here.\n")
         report = lint_memory(self.store)
@@ -236,6 +327,68 @@ class OrphanTests(LintTests):
         report = lint_memory(self.store)
         self.assertIn(str(page.stem), " ".join(
             f.page for f in report.findings if f.check == "link.orphan"))
+
+
+class HandwrittenLinkTests(LintTests):
+    """A hand-written memory note is where a broken link most often lands.
+
+    The schema checks `continue` on a page without the extractor marker; the link
+    check used to sit after that `continue`, so it only ever ran on provider-written
+    fact pages and every broken link in a hand-written note was invisible.
+    """
+
+    def test_a_handwritten_note_reports_its_dangling_link(self):
+        (self.mem / "note.md").write_text(
+            "---\ntitle: Note\n---\n\n# Note\n\nSee [[nowhere-page]].\n",
+            encoding="utf-8")
+        report = lint_memory(self.store)
+        lines = [f.line for f in report.findings if f.check == "link.dangling"]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("nowhere-page", lines[0])
+
+    def test_a_handwritten_overview_page_gets_no_schema_findings(self):
+        (self.mem / "overview.md").write_text(
+            "# Overview\n\nProse without frontmatter.\n", encoding="utf-8")
+        report = lint_memory(self.store)
+        checks = [c for c, _s in self.checks(report)]
+        self.assertNotIn("frontmatter.incomplete", checks)
+        self.assertNotIn("claim.missing", checks)
+
+
+class UnlinkableNameTests(LintTests):
+    """A page whose path a wikilink cannot carry must not be linted as missing.
+
+    The catalog now lists such pages as plain paths, so treating them as uncatalogued
+    (or as orphans) would be a warning the user can never clear.
+    """
+
+    def _hostile(self):
+        # a memory page keeps the lint pass from returning early on an empty
+        # memory zone, and gives the catalog a second entry to compare against
+        (self.mem / "note.md").write_text("---\ntitle: Note\n---\n\n# Note\n",
+                                          encoding="utf-8")
+        (self.root / "a").mkdir(exist_ok=True)
+        path = self.root / "a" / "we|ird.md"
+        path.write_text("# Weird\n", encoding="utf-8")
+        return path
+
+    def test_it_is_not_demanded_as_a_catalog_link(self):
+        from hwiki.catalog import build_index
+        self._hostile()
+        (self.root / "index.md").write_text(build_index(self.store), encoding="utf-8")
+        report = lint_memory(self.store)
+        checks = [c for c, _s in self.checks(report)]
+        self.assertNotIn("catalog.entry_missing", checks)
+        self.assertNotIn("catalog.stale", checks)
+        self.assertNotIn("link.orphan", checks)
+
+    def test_a_linkable_page_is_still_demanded(self):
+        from hwiki.catalog import build_index
+        self._hostile()
+        (self.root / "a" / "plain.md").write_text("# Plain\n", encoding="utf-8")
+        (self.root / "index.md").write_text(build_index(self.store), encoding="utf-8")
+        report = lint_memory(self.store)
+        self.assertNotIn("catalog.entry_missing", [c for c, _s in self.checks(report)])
 
 
 class SemanticSuggestionTests(unittest.TestCase):
@@ -335,3 +488,353 @@ class SemanticSuggestionTests(unittest.TestCase):
                           session_id="s")
         alone.accept(p["id"])
         self.assertEqual(suggest_review_pairs(alone).findings, [])
+
+
+class PathQualifiedLinkTests(unittest.TestCase):
+    """Obsidian path-qualified links (``[[Folder/Page]]``) are first-class links.
+
+    The catalog emits them once duplicate stems exist, and a person writing in
+    Obsidian produces them by hand. Lint must resolve them against the page it
+    names — not call them stale, and not call the page they point at missing.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "vault"
+        self.mem = self.root / MEMORY_REL
+        self.mem.mkdir(parents=True)
+        for rel in ("Hermes/Decisions.md", "Projects/Alpha/Decisions.md"):
+            path = self.root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"# Decisions\n\n{rel}\n", encoding="utf-8")
+        (self.mem / "fact.md").write_text(
+            "---\ntitle: Prefers dark mode\nkind: preference\nstatus: accepted\n---\n\n"
+            "# Prefers dark mode\n", encoding="utf-8")
+        self.store = WikiStore(root=self.root, memory_dir=MEMORY_REL.as_posix())
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _catalog_findings(self, text):
+        (self.root / "index.md").write_text(text, encoding="utf-8")
+        report = lint_memory(self.store)
+        return [f.line for f in report.findings if f.check.startswith("catalog.")]
+
+    def test_a_path_qualified_catalog_is_not_stale(self):
+        findings = self._catalog_findings(
+            "# Index\n\n"
+            "- [[Hermes/Decisions|Decisions]]\n"
+            "- [[Projects/Alpha/Decisions|Decisions]]\n"
+            "- [[fact]]\n")
+        self.assertEqual(findings, [])
+
+    def test_a_path_qualified_link_in_a_page_is_not_dangling(self):
+        (self.mem / "note.md").write_text(
+            "---\ntitle: Note\nextractor: hwiki-extractor\nkind: note\n"
+            "status: accepted\n---\n\n# Note\n\nSee [[Projects/Alpha/Decisions]].\n",
+            encoding="utf-8")
+        report = lint_memory(self.store)
+        self.assertNotIn(("link.dangling", ERROR), self.checks(report))
+
+    def test_a_bare_shared_stem_covers_only_the_page_it_resolves_to(self):
+        """Coverage means what ``resolve_page`` means, even for a duplicate stem.
+
+        A bare ``[[Decisions]]`` has always resolved to the first match, so it really
+        does catalogue that page; claiming it covered *both* overstated coverage, and
+        claiming neither understated it. The twin it does not name is reported missing.
+        """
+        findings = self._catalog_findings(
+            "# Index\n\n- [[Decisions]]\n- [[fact]]\n")
+        resolved = self.store.resolve_page("Decisions")
+        self.assertIsNotNone(resolved)
+        missing = [f for f in findings if "catalog.entry_missing" in f]
+        self.assertEqual(len(missing), 1, findings)
+        self.assertNotIn(resolved.path, " ".join(missing))
+        self.assertEqual([f for f in findings if "catalog.ambiguous" in f], [])
+
+    def test_one_missing_twin_is_still_reported(self):
+        findings = self._catalog_findings(
+            "# Index\n\n- [[Hermes/Decisions]]\n- [[fact]]\n")
+        self.assertTrue(any("projects/alpha/decisions" in f.lower() for f in findings),
+                        findings)
+
+    def test_a_folder_qualified_catalog_entry_counts_as_navigation(self):
+        """A memory note whose stem is duplicated elsewhere is still catalogued.
+
+        The catalog names the folder for duplicate stems, so counting a catalog
+        entry as an inbound route has to resolve the same way.
+        """
+        curated = self.root / "Hermes" / "fact.md"
+        curated.parent.mkdir(parents=True, exist_ok=True)
+        curated.write_text("# fact\n\nA curated page that shares the stem.\n",
+                           encoding="utf-8")
+        (self.root / "index.md").write_text(
+            "# Index\n\n- [[Hermes/fact|fact]]\n- [[Hermes/Decisions|Decisions]]\n"
+            "- [[Projects/Alpha/Decisions|Decisions]]\n"
+            f"- [[{MEMORY_REL.as_posix()}/fact|fact]]\n", encoding="utf-8")
+        report = lint_memory(self.store)
+        orphans = [f.line for f in report.findings if f.check == "link.orphan"]
+        self.assertEqual(orphans, [])
+
+    def checks(self, report):
+        return [(f.check, f.severity) for f in report.findings]
+
+
+class LinkIdentityTests(unittest.TestCase):
+    """Catalog and orphan checks must compare page identity, not file stems.
+
+    A path-qualified link names one page; collapsing it back to its stem makes two
+    pages look equally covered, which hides a page nobody navigates to and claims
+    coverage for a page that is not in the catalog. A bare link to a stem that two
+    pages share likewise cannot say which page it means, so it must not count as an
+    entry for either one.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "vault"
+        mem = self.root / MEMORY_REL
+        (mem / "a").mkdir(parents=True)
+        (mem / "b").mkdir(parents=True)
+        (mem / "a" / "note.md").write_text("---\ntitle: Note A\n---\n\n# Note A\n",
+                                           encoding="utf-8")
+        (mem / "b" / "note.md").write_text("---\ntitle: Note B\n---\n\n# Note B\n",
+                                           encoding="utf-8")
+        (mem / "fact.md").write_text(
+            "---\ntitle: Prefers dark mode\nkind: preference\nstatus: accepted\n---\n\n"
+            "# Prefers dark mode\n", encoding="utf-8")
+        for rel in ("Hermes/Decisions.md", "Projects/Alpha/Decisions.md",
+                    "Docs/Plan.md", "docs/plan.md"):
+            path = self.root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"# {Path(rel).stem}\n\nbody\n", encoding="utf-8")
+        self.store = WikiStore(root=self.root, memory_dir=MEMORY_REL.as_posix())
+        self.mem_rel = MEMORY_REL.as_posix()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def findings(self, text):
+        (self.root / "index.md").write_text(text, encoding="utf-8")
+        report = lint_memory(self.store)
+        return report.findings
+
+    def catalogue_all(self):
+        return (
+            f"# Index\n\n"
+            f"- [[{self.mem_rel}/a/note|note]]\n"
+            f"- [[{self.mem_rel}/b/note|note]]\n"
+            f"- [[{self.mem_rel}/fact|fact]]\n"
+            f"- [[Hermes/Decisions|Decisions]]\n"
+            f"- [[Projects/Alpha/Decisions|Decisions]]\n"
+            f"- [[Docs/Plan]]\n"
+            f"- [[docs/plan]]\n")
+
+    def test_catalogue_of_every_page_reports_nothing(self):
+        findings = self.findings(self.catalogue_all())
+        self.assertEqual(findings, [], [f.line for f in findings])
+
+    def test_a_missing_orphan_twin_is_not_hidden_by_a_path_qualified_entry(self):
+        text = self.catalogue_all().replace(
+            f"- [[{self.mem_rel}/b/note|note]]\n", "")
+        findings = self.findings(text)
+        orphans = [f.page for f in findings if f.check == "link.orphan"]
+        self.assertIn(f"{self.mem_rel}/b/note.md", orphans)
+
+    def test_a_bare_shared_stem_covers_the_page_the_resolver_picks(self):
+        findings = self.findings(f"# Index\n\n- [[Decisions]]\n- [[{self.mem_rel}/fact|fact]]\n")
+        checks = [f.check for f in findings]
+        resolved = self.store.resolve_page("Decisions")
+        missing = [f.detail.lower() for f in findings if f.check == "catalog.entry_missing"]
+        twin = ("hermes/decisions.md" if resolved.path.lower().endswith("projects/alpha/decisions.md")
+                else "projects/alpha/decisions.md")
+        self.assertTrue(any(twin in m for m in missing), missing)
+        self.assertFalse(any(resolved.path.lower() in m for m in missing), missing)
+        self.assertNotIn("catalog.ambiguous", checks)
+        self.assertNotIn("catalog.stale", checks)
+
+    def test_a_case_colliding_entry_covers_only_the_page_it_names(self):
+        text = self.catalogue_all().replace("- [[docs/plan]]\n", "")
+        findings = self.findings(text)
+        self.assertEqual([f.line for f in findings if f.check == "catalog.ambiguous"], [])
+        missing = [f.detail.lower() for f in findings if f.check == "catalog.entry_missing"]
+        self.assertEqual(len(missing), 1, [f.line for f in findings])
+        self.assertIn("docs/plan.md", missing[0])
+
+
+
+class ArtifactScopeTests(LintTests):
+    """Generated artifacts are not pages the catalog must carry.
+
+    ``maintenance.md`` is written after the artifacts job, so the index regenerated in
+    the same tick can never list it. Requiring it made every later tick rewrite the
+    index for no change.
+    """
+
+    def test_the_maintenance_report_is_not_demanded_in_the_index(self):
+        from hwiki import maintain
+        from hwiki.catalog import build_index
+        self.write = (self.mem / maintain.MAINTENANCE_FILENAME)
+        self.write.write_text("---\ntitle: Maintenance\ntype: maintenance\n"
+                              "status: generated\n---\n\n# Maintenance\n", encoding="utf-8")
+        (self.mem / "fact.md").write_text(
+            "---\ntitle: Fact\n---\n\n# Fact\n", encoding="utf-8")
+        (self.root / "index.md").write_text(build_index(self.store), encoding="utf-8")
+        report = lint_memory(self.store)
+        missing = [f.line for f in report.findings if f.check == "catalog.entry_missing"]
+        self.assertEqual(missing, [])
+
+    def test_artifact_names_agree_with_the_generated_files(self):
+        from hwiki import catalog, maintain
+        names = lint._catalog_artifact_names()
+        self.assertIn(maintain.MAINTENANCE_FILENAME.lower(), names)
+        self.assertIn(catalog.INDEX_FILENAME.lower(), names)
+        self.assertIn(catalog.LOG_FILENAME.lower(), names)
+        self.assertEqual(maintain.MAINTENANCE_FILENAME, catalog.MAINTENANCE_FILENAME)
+        zone = "Hermes/Memory/Auto"
+        self.assertTrue(catalog.is_catalog_artifact(f"{zone}/{maintain.MAINTENANCE_FILENAME}",
+                                                    memory_dir=zone))
+        self.assertFalse(catalog.is_catalog_artifact("Projects/X/maintenance.md",
+                                                     memory_dir=zone))
+        self.assertFalse(catalog.is_catalog_artifact("Projects/X/index.md",
+                                                     memory_dir=zone))
+    def test_only_the_generated_report_path_is_an_artifact(self):
+        """A curated page that happens to be called maintenance.md is a page.
+
+        Matching the basename anywhere meant such a page was never demanded in the
+        catalog — it could be missing from the index forever without a warning.
+        """
+        from hwiki import maintain
+        from hwiki.catalog import build_index
+        (self.root / "Projects" / "X").mkdir(parents=True)
+        (self.root / "Projects" / "X" / "maintenance.md").write_text(
+            "# Maintenance window\n\nEvery Sunday.\n", encoding="utf-8")
+        (self.mem / maintain.MAINTENANCE_FILENAME).write_text(
+            "---\ntitle: Report\ntype: maintenance\nstatus: generated\n---\n\n# R\n",
+            encoding="utf-8")
+        (self.mem / "fact.md").write_text("---\ntitle: F\n---\n\n# F\n",
+                                          encoding="utf-8")
+        generated = build_index(self.store)
+        # folder-qualified: the bare stem also names the generated report page
+        self.assertIn("[[Projects/X/maintenance|maintenance]]", generated)
+        # simulate an index that forgot the curated page
+        (self.root / "index.md").write_text(
+            "\n".join(line for line in generated.splitlines()
+                      if "[[Projects/X/maintenance" not in line) + "\n",
+            encoding="utf-8")
+        report = lint_memory(self.store)
+        missing = [f.line for f in report.findings if f.check == "catalog.entry_missing"]
+        self.assertTrue(any("Projects/X/maintenance.md" in line for line in missing), missing)
+        self.assertFalse(any(f"Auto/{maintain.MAINTENANCE_FILENAME}" in line
+                             for line in missing), missing)
+
+    def test_an_ambiguous_catalog_entry_covers_neither_page(self):
+        """Lint credited every candidate; the resolver refuses to pick one.
+
+        ``[[DOCS/PLAN]]`` matched two pages case-insensitively, so both counted as
+        listed although the reader can open neither. Coverage must mean what
+        ``resolve_page`` means.
+        """
+        from hwiki.catalog import build_index
+        (self.root / "Docs").mkdir()
+        (self.root / "docs").mkdir(exist_ok=True)
+        (self.root / "Docs" / "Plan.md").write_text("# upper\n", encoding="utf-8")
+        (self.root / "docs" / "plan.md").write_text("# lower\n", encoding="utf-8")
+        (self.mem / "note.md").write_text("---\ntitle: Note\n---\n\n# Note\n",
+                                          encoding="utf-8")
+        index = (self.root / "index.md")
+        index.write_text(
+            "---\ntitle: Wiki Index\nsource: hwiki-catalog\n---\n\n"
+            "*2 curated page(s) across 2 section(s), 1 memory note(s) — 3 page(s) catalogued.*\n\n"
+            "## Docs\n\n- [[docs/plan]]\n\n## Docs\n\n- [[DOCS/PLAN]]\n\n"
+            "## Note\n\n- [[note]]\n", encoding="utf-8")
+        report = lint_memory(self.store)
+        missing = [f.line for f in report.findings if f.check == "catalog.entry_missing"]
+        self.assertTrue(any("Docs/Plan.md" in line for line in missing), missing)
+        self.assertFalse(any("docs/plan.md" in line for line in missing), missing)
+        # and the catalog the generator writes is always fully resolved
+        index.write_text(build_index(self.store), encoding="utf-8")
+        report = lint_memory(self.store)
+        self.assertEqual([f.line for f in report.findings
+                          if f.check == "catalog.entry_missing"], [])
+
+    def test_candidates_never_credit_a_page_the_resolver_refuses(self):
+        """Parity lock: catalog candidates and ``resolve_page`` must agree.
+
+        The catalog used to credit a case-different path (``readme.md`` for
+        ``README.md``, ``a/TARGET.MD``) that the resolver returns ``None`` for, and to
+        treat a unique-stem ``.md`` miss as a case-folded hit. Every target is checked
+        against the store: one candidate means that page, several mean the resolver
+        refuses to choose, none means nothing matches.
+        """
+        from hwiki.lint import _Identity
+
+        for rel in ("README.md", "docs/plan.md", "Docs/Plan.md",
+                    "a/target.md", "b/target.md", "Hermes/Decisions.md"):
+            path = self.root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"# {rel}\n", encoding="utf-8")
+        pages = list(self.store.iter_pages())
+        identity = _Identity()
+        for page in pages:
+            identity.add(page)
+        identity.resolver = lambda ref: self.store._resolve_in(ref, pages)
+
+        targets = ["readme.md", "README.md", "a/TARGET.MD", "a/target.md",
+                   "b/target.MD", "DOCS/PLAN", "docs/plan", "Docs/Plan",
+                   "decisions", "Hermes/DECISIONS.MD", "target", "plan",
+                   "a/target", "nope.md", "nope"]
+        for target in targets:
+            candidates = identity.candidates(target)
+            resolved = identity.resolve(target)
+            with self.subTest(target=target):
+                if resolved is not None:
+                    # bare slug/title tiers keep first-match, so the resolver's pick is
+                    # one of the candidates; the folded tier never picks between two
+                    self.assertIn(resolved, candidates)
+                elif len(candidates) == 1:
+                    self.fail(f"{target!r}: credited {candidates} but the resolver refused")
+
+    def test_slugified_filename_twins_resolve_like_the_store(self):
+        """``a/Foo Bar.md`` and ``b/foo-bar.md`` share a slugified stem, not a stem.
+
+        The catalog must not emit a bare link whose meaning depends on directory
+        iteration order, and lint's candidate set must be exactly the page the store
+        resolves — otherwise the two disagree about which page an entry covers.
+        """
+        from hwiki.catalog import build_index
+        from hwiki.lint import _Identity
+        (self.root / "a").mkdir()
+        (self.root / "b").mkdir()
+        (self.root / "a" / "Foo Bar.md").write_text("# first\n", encoding="utf-8")
+        (self.root / "b" / "foo-bar.md").write_text("# second\n", encoding="utf-8")
+        pages = list(self.store.iter_pages())
+        identity = _Identity()
+        for page in pages:
+            identity.add(page)
+        identity.resolver = lambda ref: self.store._resolve_in(ref, pages)
+        for target in ("foo-bar", "Foo Bar", "a/Foo Bar", "b/foo-bar"):
+            resolved = identity.resolve(target)
+            with self.subTest(target=target):
+                self.assertEqual(identity.candidates(target),
+                                 {resolved} if resolved else set())
+        index = build_index(self.store)
+        # both pages must be folder-qualified: their slugified stems collide, and the
+        # store picks the first glob match, which is not a stable answer
+        self.assertIn("[[a/Foo Bar|Foo Bar]]", index)
+        self.assertIn("[[b/foo-bar|foo-bar]]", index)
+        self.assertNotIn("- [[foo-bar]]", index)
+        for line in index.splitlines():
+            if not line.startswith("- [["):
+                continue
+            target = line.split("[[", 1)[1].split("]]", 1)[0].split("|", 1)[0]
+            page = self.store.resolve_page(target)
+            self.assertIsNotNone(page, target)
+            if "Foo Bar" in line:
+                self.assertEqual(page.path, "a/Foo Bar.md")
+            else:
+                self.assertEqual(page.path, "b/foo-bar.md")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

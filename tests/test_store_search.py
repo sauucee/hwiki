@@ -99,7 +99,11 @@ def main() -> int:
         _out, backlinks = store.link_graph()
         check("backlink le-chonk <- mistral-models", "mistral-models" in backlinks.get("le-chonk", []),
               repr(backlinks))
-        check("dangling detected", "nowhere-page" in store.dangling_links().get("mistral-models", []),
+        check("dangling detected", "nowhere-page" in store.dangling_links(key="path").get(
+            "wiki/concepts/mistral-models.md", []),
+              repr(store.dangling_links(key="path")))
+        check("dangling default stays slug-keyed",
+              "mistral-models" in store.dangling_links(),
               repr(store.dangling_links()))
 
         print("\n[3] secret guard")

@@ -103,11 +103,42 @@ class JobTests(_Vault):
         self.assertEqual(heal.count, 1)
 
     def test_stale_catalog_is_reported_and_regenerated(self):
-        self.accept("Backups run nightly with restic to B2")
-        (self.vault / "index.md").write_text("# Wiki Index\n\n- nothing\n", encoding="utf-8")
+        self.write_fact_page("backups", "Backups run nightly with restic to B2")
+        (self.vault / "index.md").write_text("# Wiki Index\n\n- [[gone-page]]\n",
+                                           encoding="utf-8")
         report = self.tick()
-        artifacts = next(j for j in report.jobs if j.name == "artifacts")
-        self.assertTrue(report.stale_artifacts or artifacts.ran)
+        # ``artifacts.ran`` is true even for "catalogs current", so assert the finding.
+        self.assertTrue(report.stale_artifacts, "a stale catalog must be reported as work")
+
+    def test_ambiguous_catalog_entry_is_work_for_the_artifacts_job(self):
+        """A catalog link the resolver refuses to resolve is stale too — regenerate it.
+
+        The lint check that reports this is newer than the artifacts job, which only
+        looked for ``catalog.stale``/``catalog.entry_missing``; an ambiguous entry was
+        therefore invisible and the tick said "catalogs current" while the index kept
+        pointing at a target no reader can open.
+        """
+        self.write_fact_page("backups", "Backups run nightly with restic to B2")
+        (self.vault / "concepts" / "backups.md").write_text(
+            "# Backups\n\nA curated page.\n", encoding="utf-8")
+        (self.vault / "concepts" / "Backups.md").write_text(
+            "# BACKUPS\n\nSame folder, same name, other case.\n", encoding="utf-8")
+        (self.vault / "index.md").write_text(
+            "# Wiki Index\n\n"
+            "- [[concepts/seed|Seed]]\n"
+            "- [[concepts/backups|backups]]\n"
+            "- [[concepts/Backups|Backups]]\n"
+            f"- [[{MEMORY_REL}/backups|backups]]\n"
+            "- [[concepts/BACKUPS]] — a stale link that names both case twins\n",
+            encoding="utf-8")
+        report = self.tick()
+        self.assertTrue(any("catalog.ambiguous" in str(item)
+                            for item in report.stale_artifacts),
+                        report.stale_artifacts)
+        # isolation: nothing here is missing, so ambiguity alone must be the trigger
+        self.assertFalse(any("entry_missing" in str(item) or "stale:" in str(item)
+                             for item in report.stale_artifacts),
+                         report.stale_artifacts)
 
 
 class BoundaryTests(_Vault):
@@ -586,9 +617,6 @@ class RenderTests(_Vault):
                                         "path"})
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 class DryRunWritesNothingTests(unittest.TestCase):
     """`--dry-run` is documented as "nothing written" — assert that on every job.
@@ -693,3 +721,62 @@ class ClockSkewTests(unittest.TestCase):
         self.store.set_meta(maintain.META_LAST_RUN,
                             datetime.now(timezone.utc).isoformat())
         self.assertFalse(maintain.due(self.store, {}))
+
+
+
+class ArtifactWriteTests(_Vault):
+    """The artifacts job must converge: one regeneration, then nothing to do.
+
+    Ambiguity is now a trigger. A hand-written index (no hwiki marker) is still never
+    overwritten, so the tick must say so and leave the bytes alone instead of claiming
+    it regenerated the catalog.
+    """
+
+    def test_regenerating_an_ambiguous_catalog_converges(self):
+        """One regeneration fixes it, and the next tick has nothing to do.
+
+        The tick writes `maintenance.md` after the artifacts job, so the index it just
+        regenerated cannot list that page. Treating it as a page the catalog must
+        contain made every later tick find an "entry_missing" and rewrite the index
+        forever — a derived write per tick that changed nothing.
+        """
+        self.write_fact_page("backups", "Backups run nightly with restic to B2")
+        (self.vault / "concepts" / "backups.md").write_text(
+            "# Backups\n\nA curated page that shares the filename.\n", encoding="utf-8")
+        (self.vault / "index.md").write_text(
+            "---\ntitle: Wiki Index\ntype: index\nsource: hwiki-catalog\n---\n\n"
+            "# Wiki Index\n\n- [[backups]] — names both pages\n", encoding="utf-8")
+        first = self.tick()
+        self.assertTrue(first.stale_artifacts, first.stale_artifacts)
+        index = (self.vault / "index.md").read_text(encoding="utf-8")
+        self.assertNotIn("[[backups]]", index)
+        self.assertIn("[[concepts/backups|backups]]", index)
+        second = self.tick()
+        self.assertFalse(second.stale_artifacts, second.stale_artifacts)
+
+    def test_a_hand_written_index_is_never_rewritten(self):
+        self.write_fact_page("backups", "Backups run nightly with restic to B2")
+        (self.vault / "concepts" / "backups.md").write_text(
+            "# Backups\n\nA curated page.\n", encoding="utf-8")
+        (self.vault / "concepts" / "Backups.md").write_text(
+            "# BACKUPS\n\nSame folder, same name, other case.\n", encoding="utf-8")
+        original = "# Wiki Index\n\n- [[concepts/BACKUPS]] — names both case twins\n"
+        (self.vault / "index.md").write_text(original, encoding="utf-8")
+        report = self.tick()
+        self.assertTrue(any("catalog.ambiguous" in str(item)
+                            for item in report.stale_artifacts), report.stale_artifacts)
+        self.assertEqual((self.vault / "index.md").read_text(encoding="utf-8"), original)
+        notes = " ".join(n for job in report.jobs for n in job.notes)
+        self.assertIn("written by hand", notes)
+    def test_an_unlinkable_page_does_not_cause_a_write_per_tick(self):
+        self.write_fact_page("backups", "Backups run nightly with restic to B2")
+        (self.vault / "concepts" / "we|ird.md").write_text(
+            "# Weird\n", encoding="utf-8")
+        first = self.tick()
+        self.assertTrue(first.written)
+        second = self.tick()
+        self.assertFalse(second.stale_artifacts, second.stale_artifacts)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -101,9 +101,23 @@ def _frontmatter(text: str) -> Dict[str, str]:
     return meta
 
 
+def _code_span_targets(text: str) -> List[str]:
+    """Single-backtick spans in ``text`` (the catalog's listing for unlinkable paths)."""
+    import re
+    return [m.group(1).strip() for m in re.finditer(r"(?<!`)`([^`\n]+)`(?!`)", text)]
+
+
 def _wikilink_targets(text: str) -> List[str]:
+    """Link targets in page text, in order, de-duplicated.
+
+    Code fences and inline code are literal, exactly as in ``WikiStore``'s
+    ``Page.links``: a note that documents wikilink syntax must not have its samples
+    reported as dangling links.
+    """
+    from .store import strip_code  # lazy: this module stays leaf-only at import time
+
     seen: List[str] = []
-    for raw in _LINK_RE.findall(text):
+    for raw in _LINK_RE.findall(strip_code(text)):
         target = raw.strip()
         if target and target not in seen:
             seen.append(target)
@@ -122,7 +136,7 @@ def lint_memory(store, *, memory_dir: Optional[Path] = None,
 
     ``store`` is a :class:`hwiki.store.WikiStore`; only its read API is used.
     """
-    from .store import scan_for_secrets  # local import keeps this module leaf-only
+    from .store import scan_for_secrets, slugify  # local import keeps this module leaf-only
 
     report = LintReport()
     root = Path(getattr(store, "root", store))
@@ -132,16 +146,46 @@ def lint_memory(store, *, memory_dir: Optional[Path] = None,
     if not pages:
         return report
 
-    # Known wikilink targets: every page slug in the vault plus every title, so a
-    # link to a page that exists but was never indexed is not called dangling.
-    known = set()
+    # Page identity, in the same tiers ``WikiStore.resolve_page`` uses: an exact
+    # root-relative path, a unique case-insensitive path, a filename slug, then a
+    # title. A tier that yields matches ends the search, so a link is ambiguous only
+    # when the store itself would be, and ``Docs/Plan.md`` never merges with
+    # ``docs/plan.md``. ``indexed`` is what the catalog is expected to list: every
+    # page except the catalog's own artifacts.
+    identity = _Identity()
+    indexed = set()
+    sources: List[Path] = []
     try:
-        for page in store.iter_pages():
-            known.add(page.slug.lower())
-            if page.title:
-                known.add(page.title.strip().lower())
+        from .catalog import is_catalog_artifact, linkable_target  # leaf-safe, local
+        try:
+            zone = mem.relative_to(root).as_posix().strip("/")
+        except ValueError:  # a memory zone outside the vault: fall back to the config
+            zone = str(getattr(store, "memory_dir", "") or "").strip("/")
+        all_pages = list(store.iter_pages())
+        # one resolver for lint and the store: a link the reader can follow must not be
+        # reported dangling, and a link the store refuses (traversal, ambiguous
+        # case-fold) must not be silently accepted
+        resolved_cache: Dict[str, object] = {}
+
+        def _resolve(reference: str):
+            if reference not in resolved_cache:
+                resolved_cache[reference] = store._resolve_in(reference, all_pages)
+            return resolved_cache[reference]
+
+        identity.resolver = _resolve
+        for page in all_pages:
+            identity.add(page)
+            # every indexed page is a possible source of an inbound link, not just
+            # the memory zone being reported on: a hand-written Hermes/ page that
+            # links a note is navigation, and ignoring it flagged linked notes
+            sources.append(Path(page.abspath))
+            if (not is_catalog_artifact(page.path, memory_dir=zone)
+                    and linkable_target(page.path)):
+                # a path a wikilink cannot carry is listed by the catalog as a plain
+                # path, so demanding a [[link]] for it would never be satisfiable
+                indexed.add(page.path)
     except Exception:  # pragma: no cover - a broken index must not stop lint
-        known = set()
+        identity, indexed, sources = _Identity(), set(), []
 
     rel_root = root
     accepted_claims: Dict[str, List[str]] = {}
@@ -164,6 +208,14 @@ def lint_memory(store, *, memory_dir: Optional[Path] = None,
             kinds = ", ".join(sorted({s.split(":", 1)[0] for s in secrets}))
             report.add("secret.content", ERROR, rel,
                        f"secret-shaped material present ({kinds}); never promote this page")
+
+        # Wikilinks are checked on every page in the zone: a hand-written note's
+        # broken link is the most common kind, and schema checks below do not apply
+        # to it (`continue`), which used to hide its dangling links entirely.
+        for link in _wikilink_targets(text):
+            if identity.known and identity.resolve(link) is None:
+                report.add("link.dangling", ERROR, rel,
+                           f"[[{link}]] does not resolve to any page")
 
         meta = _frontmatter(text)
         is_extractor_page = meta.get("extractor") == EXTRACTOR_MARKER
@@ -195,7 +247,7 @@ def lint_memory(store, *, memory_dir: Optional[Path] = None,
                            "status is superseded but `superseded_by` names no page")
             else:
                 for link in links:
-                    if known and link.lower() not in known:
+                    if identity.known and not identity.candidates(link):
                         report.add("supersede.orphan", WARN, rel,
                                    f"superseded_by points at missing page [[{link}]]")
 
@@ -208,55 +260,189 @@ def lint_memory(store, *, memory_dir: Optional[Path] = None,
             report.add("page.oversized", INFO, rel,
                        f"{len(text)} chars exceeds {max_page_chars}; consider splitting")
 
-        for link in _wikilink_targets(text):
-            if known and link.lower() not in known:
-                report.add("link.dangling", ERROR, rel,
-                           f"[[{link}]] does not resolve to any page")
-
     for claim, owners in sorted(accepted_claims.items()):
         if len(owners) > 1:
             report.add("duplicate.claim", WARN, owners[0],
                        f"same claim accepted on {len(owners)} pages: {', '.join(owners)}")
 
-    _lint_catalog(report, root, pages, rel_root)
-    _lint_orphans(report, root, pages, rel_root)
+    _lint_catalog(report, root, identity=identity, indexed=indexed)
+    _lint_orphans(report, root, pages, rel_root, identity=identity,
+                  sources=sources)
     _lint_answers(report, mem, rel_root, pages)
     return report
 
 
+class _Identity:
+    """How a wikilink target maps to pages: the store's resolution order, per tier.
+
+    Exact paths first (the only way to tell two pages with the same filename apart),
+    then case-insensitive paths — accepted only when unique — then filename slugs,
+    then titles. Each tier is consulted only when the previous one is empty, so lint
+    never calls a link ambiguous when the store would resolve it deterministically.
+    """
+
+    TIERS = ("by_path", "by_stem", "folded_path", "by_slug", "by_title")
+
+    def __init__(self) -> None:
+        self.resolver = None  # injectable: lint_memory passes WikiStore._resolve_in
+        self.by_path: Dict[str, set] = {}
+        self.by_stem: Dict[str, set] = {}
+        self.folded_path: Dict[str, set] = {}
+        self.by_slug: Dict[str, set] = {}
+        self.by_title: Dict[str, set] = {}
+
+    @property
+    def known(self) -> bool:
+        """False when the vault could not be enumerated; then invent nothing."""
+        return any(getattr(self, tier) for tier in self.TIERS)
+
+    def add(self, page) -> None:
+        from .store import slugify  # lazy: this module stays leaf-only at import time
+
+        path = page.path
+        # a ``.md`` reference whose folder is wrong still resolves by unique filename
+        self.by_stem.setdefault(page.slug, set()).add(path)
+        keys = [path]
+        if path.lower().endswith(".md"):
+            keys.append(path[:-3])
+        for key in keys:
+            self.by_path.setdefault(key, set()).add(path)
+            self.folded_path.setdefault(key.lower(), set()).add(path)
+        for key in {page.slug, slugify(page.slug)}:
+            self.by_slug.setdefault(key, set()).add(path)
+        if page.title:
+            self.by_title.setdefault(slugify(page.title), set()).add(path)
+
+    def resolve(self, target: str) -> Optional[str]:
+        """The page path the store would open for ``target``, or ``None``.
+
+        ``link.dangling`` asks this, not ``candidates``: a target the store refuses
+        (traversal, an absolute path, an ambiguous case-folded path) is dangling even
+        though some tier had a candidate set. ``lint_memory`` injects the store's own
+        resolver, so the two cannot drift apart.
+        """
+        if self.resolver is not None:
+            page = self.resolver(target)
+            return None if page is None else page.path
+        from .store import _is_traversal  # lazy: this module stays leaf-only at import time
+
+        raw = (target or "").strip()
+        if raw.startswith("[[") and raw.endswith("]]"):
+            raw = raw[2:-2]
+        if not raw or _is_traversal(raw):
+            return None
+        exact = self.by_path.get(raw)
+        if exact:
+            return sorted(exact)[0] if len(exact) > 1 else next(iter(exact))
+        hits = self._tier_hits(raw)
+        if hits is not None and len(hits) == 1:
+            return next(iter(hits))
+        return None
+
+    def _tier_hits(self, target: str) -> Optional[set]:
+        """Candidate paths for the first non-empty tier, or ``None`` when all are empty."""
+        from .store import slugify  # lazy: this module stays leaf-only at import time
+
+        target = target.split("|", 1)[0].split("#", 1)[0].strip()
+        if target.lower().endswith(".md"):
+            stem = target.rsplit("/", 1)[-1][:-3].split("\\")[-1]
+            if stem in self.by_stem:
+                return set(self.by_stem[stem])
+        folded = self.folded_path.get(target.lower())
+        if folded:
+            return set(folded)
+        for key in (target, slugify(target)):
+            if key in self.by_slug:
+                return set(self.by_slug[key])
+        return self.by_title.get(slugify(target))
+
+    def candidates(self, target: str) -> set:
+        """The pages a link target names, as the store resolves them.
+
+        Parity is by construction: when one page resolves, that page is the only
+        candidate. Only an unresolvable target can report several — a case-folded path
+        that matches two pages — so the catalog can call it ambiguous instead of stale
+        without ever crediting a page the reader cannot open.
+        """
+        resolved = self.resolve(target)
+        if resolved is not None:
+            return {resolved}
+        from .store import _is_traversal, slugify  # lazy: leaf-only at import time
+
+        target = target.strip()
+        if target.startswith("[[") and target.endswith("]]"):
+            target = target[2:-2]
+        if not target or _is_traversal(target):
+            return set()
+        folded = self.folded_path.get(target.lower())
+        if folded and len(folded) > 1:
+            return set(folded)
+        for key in (target, slugify(target)):
+            hits = self.by_slug.get(key)
+            if hits and len(hits) > 1:
+                return set(hits)
+        return set()
+
+
 def _lint_orphans(report: LintReport, root: Path, pages: Iterable[Path],
-                  rel_root: Path) -> None:
+                  rel_root: Path, *, identity: Optional[_Identity] = None,
+                  sources: Optional[Iterable[Path]] = None) -> None:
     """Pages that nothing navigates to.
 
     The pattern calls these orphans: no inbound links. In this wiki navigation is the
     catalog ("read index.md first"), so a catalog entry is an inbound route and counts.
     A page with neither a link nor an entry is reachable only by luck.
 
+    Pages are compared by identity (their root-relative path), never by stem: two
+    pages can share a filename, and collapsing a folder-qualified entry back to the
+    stem made one page look catalogued because its twin was. An entry counts only
+    when it names exactly one page; an inbound link that names several counts for all
+    of them, because it does navigate to one of them.
+
     Deliberately INFO, and deliberately quiet for generated artifacts: the maintenance
     report, catalogs and filed answers are entry points by design, and flagging them every
     run would train the reader to ignore the check.
     """
     pages = list(pages)
+    identity = identity or _Identity()
+
+    def _rel(path: Path) -> str:
+        try:
+            return path.relative_to(rel_root).as_posix()
+        except ValueError:
+            return path.name
+
+    # ``pages`` is what gets reported on (the memory zone); ``sources`` is every
+    # indexed page, because navigation crosses zones.
     inbound = {}
-    for path in pages:
+    for path in (list(sources) if sources is not None else pages):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         for target in _wikilink_targets(text):
-            inbound.setdefault(target.strip().lower(), set()).add(path.stem)
+            for candidate in identity.candidates(target):
+                inbound.setdefault(candidate, set()).add(_rel(path))
 
     listed = set()
     index = root / "index.md"
     if index.exists():
         try:
-            listed = {t.strip().lower() for t in
-                      _wikilink_targets(index.read_text(encoding="utf-8", errors="replace"))}
+            index_text = index.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            listed = set()
+            index_text = ""
+        for target in _wikilink_targets(index_text):
+            candidates = identity.candidates(target)
+            if len(candidates) == 1:
+                listed |= candidates
+        # the catalog lists unlinkable paths in backticks; that is navigation too
+        from .catalog import linkable_target
+        for span in _code_span_targets(index_text):
+            if linkable_target(span):
+                continue  # a plain code span only counts where a link cannot
+            listed |= identity.candidates(span)
 
     for path in pages:
-        slug = path.stem.lower()
         if path.parent.name == "answers":
             continue  # answer.unreferenced already covers filed answers
         try:
@@ -265,23 +451,49 @@ def _lint_orphans(report: LintReport, root: Path, pages: Iterable[Path],
             continue
         if meta.get("status") == "generated" or meta.get("type") in ("maintenance", "log"):
             continue
-        if slug in listed:
+        rel = _rel(path)
+        if rel in listed:
             continue
-        backlinks = inbound.get(slug, set()) - {path.stem}
+        backlinks = inbound.get(rel, set()) - {rel}
         if backlinks:
             continue
-        try:
-            rel = path.relative_to(rel_root).as_posix()
-        except ValueError:
-            rel = path.name
         report.add("link.orphan", INFO, rel,
                    "no inbound links and not listed in index.md; nothing navigates here")
 
 
 
-def _lint_catalog(report: LintReport, root: Path, pages: Iterable[Path],
-                  rel_root: Path) -> None:
-    """index.md must not list pages that are gone, nor omit pages that exist."""
+def _catalog_artifact_names() -> set:
+    """Basenames of the generated catalog files, for callers that only have a name.
+
+    Location decides whether a file is an artifact (``catalog.is_catalog_artifact``):
+    ``index.md``/``log.md`` at the root, the maintenance report at the top of the
+    memory zone. A curated ``Projects/X/maintenance.md`` is a page, not the report.
+    """
+    try:
+        from .catalog import INDEX_FILENAME, LOG_FILENAME, MAINTENANCE_FILENAME
+    except Exception:  # pragma: no cover - bundled, defensive only
+        INDEX_FILENAME, LOG_FILENAME, MAINTENANCE_FILENAME = (
+            "index.md", "log.md", "maintenance.md")
+    return {INDEX_FILENAME.lower(), LOG_FILENAME.lower(), MAINTENANCE_FILENAME.lower()}
+
+
+def _lint_catalog(report: LintReport, root: Path, *,
+                  identity: Optional[_Identity] = None,
+                  indexed: Optional[Iterable[str]] = None) -> None:
+    """index.md must not list pages that are gone, nor omit pages that exist.
+
+    The catalog covers the **whole vault**: ``build_index`` emits one link per page,
+    curated pages and memory notes alike. A target is resolved like a wikilink: exact
+    path (with or without ``.md``), then a unique case-insensitive match, then a
+    unique slug or title.
+
+    Coverage is what the reader can open, not what a set of candidates suggests: an
+    entry covers exactly the page ``resolve_page`` returns for it. A case-folded target
+    that matches two pages resolves to neither, so it covers neither and is reported as
+    ambiguous; a bare stem that two pages share resolves to the first match, so it
+    covers that page and the other is reported missing. Judging either direction against
+    the memory zone alone reported every curated page as gone on every run.
+    """
     index = root / "index.md"
     if not index.exists():
         return
@@ -290,16 +502,29 @@ def _lint_catalog(report: LintReport, root: Path, pages: Iterable[Path],
     except OSError:
         report.add("catalog.unreadable", WARN, "index.md", "could not read the catalog")
         return
-    listed = {t.strip().lower() for t in _wikilink_targets(text)}
+    listed = [t.strip() for t in _wikilink_targets(text)]
     if not listed:
         return
-    present = {p.stem.lower() for p in pages}
-    for slug in sorted(listed - present):
-        report.add("catalog.stale", WARN, "index.md",
-                   f"lists [[{slug}]] but no such memory page exists")
-    for slug in sorted(present - listed):
-        report.add("catalog.entry_missing", WARN, "index.md",
-                   f"memory page `{slug}` is not listed; run `hermes hwiki catalog`")
+    if identity is None or indexed is None or not identity.known:
+        return  # the vault could not be enumerated; invent nothing
+    covered = set()
+    for target in listed:
+        resolved = identity.resolve(target)
+        if resolved is not None:
+            covered.add(resolved)
+            continue
+        candidates = identity.candidates(target)
+        if len(candidates) > 1:
+            report.add("catalog.ambiguous", WARN, "index.md",
+                       f"lists [[{target}]] which names {len(candidates)} pages "
+                       f"({', '.join(sorted(candidates))}); use a folder-qualified link")
+        else:
+            report.add("catalog.stale", WARN, "index.md",
+                       f"lists [[{target}]] but no page in the vault resolves it")
+    for path in sorted(indexed):
+        if path not in covered:
+            report.add("catalog.entry_missing", WARN, "index.md",
+                       f"page `{path}` is not listed; run `hermes hwiki catalog`")
 
 
 def _lint_answers(report: LintReport, mem: Path, rel_root: Path,

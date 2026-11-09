@@ -65,7 +65,9 @@ keeps two special files beside the pages. hwiki maintains both automatically:
   the catalog cannot silently drift when a model call fails.
 - **`log.md`** — append-only timeline. Every entry is
   `## [YYYY-MM-DD] kind | subject`, so the history is greppable:
-  `grep "^## \[" log.md | tail -5`.
+  `grep "^## \[" log.md | tail -5`. Appends are locked (on a lockfile that is never
+  deleted), refused through a symlink, and never rewrite earlier bytes; the reader
+  takes a bounded tail, so a long history stays cheap.
 
 Both are **derived artifacts**: delete them and nothing is lost. They are
 written to the wiki root, never into `memory_dir` — that zone belongs to
@@ -234,11 +236,11 @@ hits from saved raw materials.
 | Tool | Purpose |
 |---|---|
 | `wiki_memory_search` | Ranked excerpts across the wiki (optional frontmatter filter) |
-| `wiki_memory_read` | Full page by path, slug or `[[wikilink]]`, with links and backlinks |
+| `wiki_memory_read` | Full page by path, slug or `[[wikilink]]`, with links, backlinks and exact `backlink_paths` |
 | `wiki_memory_write` | Append a dated fact to a page in the memory zone |
 | `wiki_memory_file` | File a synthesised answer as a reusable page (`answers/`) |
 | `wiki_memory_confidence` | Is this retrieval trustworthy? Advisory signal for abstaining |
-| `wiki_memory_status` | Index stats; with `lint`, dangling links and orphan pages |
+| `wiki_memory_status` | Index stats; with `lint`, dangling links and orphans (slug fields plus exact `*_paths`) |
 
 The fact layer (`facts.py`) additionally stamps every recall hit with a citation:
 `page` (the vault page slug) and `cite` (`[[<slug>]]`), plus `accepted` (the date

@@ -614,9 +614,15 @@ def _artifact_findings(store, vault_root: Path, memory_rel: Path) -> List[str]:
     # regenerated a stale index. Ask the object for what it actually has.
     for finding in getattr(report, "findings", []):
         check = str(getattr(finding, "check", ""))
-        if check in ("catalog.stale", "catalog.entry_missing"):
+        if check in CATALOG_CHECKS:
             findings.append(f"{check}: {getattr(finding, 'page', '')}")
     return findings[:MAX_LISTED]
+
+
+#: Lint checks that mean "regenerate index.md". Keep this list next to the job that
+#: consumes it: a catalog check added to ``lint`` without being added here is work the
+#: tick can never see (that is how ``catalog.ambiguous`` first shipped invisible).
+CATALOG_CHECKS = ("catalog.stale", "catalog.entry_missing", "catalog.ambiguous")
 
 
 def interval_hours(config: Optional[Dict[str, Any]] = None) -> float:
