@@ -25,6 +25,11 @@ import sys
 import time
 import uuid
 from datetime import date, datetime, timezone
+
+try:  # POSIX advisory locks serialize independent hwiki writers.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback is process-local
+    fcntl = None
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -57,6 +62,9 @@ except ImportError:
 # Recall is a read path, so a miss is buffered in memory and flushed by the next
 # maintenance tick instead of writing to SQLite on every empty lookup.
 _QUESTION_BUFFER = None
+
+# Reentrant per-thread state for ProposalStore.lifecycle_lock().
+_LIFECYCLE_LOCK_STATE = threading.local()
 
 
 def question_buffer():
@@ -581,23 +589,140 @@ def write_fact_page(vault_root: Path, memory_rel: Path, proposal: Dict[str, Any]
     return page
 
 
-def _compiled_sections(text: str) -> List[str]:
-    """Claim headings inside ``compile``'s delimited sections.
+_COMPILED_SECTION_RE = re.compile(
+    r"<!-- hwiki:compiled:start -->(.*?)<!-- hwiki:compiled:end -->", re.DOTALL)
 
-    Kept local and regex-only (no import of ``compile.py``) so this recall path
-    has no dependency on the write-side module.
+
+def _compiled_section_records(text: str) -> List[Dict[str, str]]:
+    """Claim and metadata of every ``compile``-merged section on a page.
+
+    ``compile`` writes a refinement as a ``###`` heading inside marker comments,
+    with a ``*kind: … · peer: … · accepted: … · proposal: <id>*`` footer. The
+    lifecycle paths need that metadata: a merged claim is a first-class accepted
+    fact, so rebuild must import it and forget must remove only it.
+
+    Kept local and regex-only (no import of ``compile.py``) so these paths have
+    no dependency on the write-side module.
     """
-    out: List[str] = []
-    for block in re.findall(
-            r"<!-- hwiki:compiled:start -->(.*?)<!-- hwiki:compiled:end -->",
-            text or "", re.DOTALL):
+    records: List[Dict[str, str]] = []
+    for block in _COMPILED_SECTION_RE.findall(text or ""):
+        claim = ""
         for line in block.splitlines():
             if line.startswith("### "):
                 claim = line[4:].strip()
-                if claim:
-                    out.append(claim)
                 break
-    return out
+        if not claim:
+            continue
+        record = {"claim": claim, "evidence": "", "kind": "", "peer": "",
+                  "accepted": "", "proposal_id": "", "superseded": "",
+                  "superseded_by": ""}
+        evidence = re.search(r"^> \*\*Evidence:\*\* (.+)$", block, re.M)
+        if evidence:
+            record["evidence"] = evidence.group(1).strip()
+        meta = re.search(r"^\*(.+?)\*$", block, re.M)
+        if meta:
+            for part in meta.group(1).split(" · "):
+                key, _, value = part.partition(":")
+                key = key.strip().lower()
+                value = value.strip()
+                if key in ("kind", "peer", "accepted"):
+                    record[key] = value
+                elif key == "proposal":
+                    record["proposal_id"] = value
+        tombstone = re.search(r"^\*Superseded by \[\[([^\]|]+)", block, re.M)
+        if tombstone:
+            record["superseded"] = "1"
+            record["superseded_by"] = tombstone.group(1).strip()
+        elif re.search(r"^\*Superseded by", block, re.M):
+            record["superseded"] = "1"
+        records.append(record)
+    return records
+
+
+def _compiled_sections(text: str) -> List[str]:
+    """Claim headings inside ``compile``'s delimited sections."""
+    return [record["claim"] for record in _compiled_section_records(text)]
+
+
+def _section_claim_key(claim: str) -> str:
+    return " ".join((claim or "").split()).lower()
+
+
+def _select_compiled_sections(matches, *, proposal_id: str = "",
+                              claim: str = "") -> List["re.Match[str]"]:
+    """Pick exactly the section(s) identified by an id, or one unique claim.
+
+    An id always wins over a claim: two hand-edited sections may share a claim
+    but only one of them is the fact being forgotten/superseded.  Claim-only
+    selection is refused when it is ambiguous, so a duplicated heading can
+    never make one call remove several independent facts.
+    """
+    records = []
+    for match in matches:
+        parsed = _compiled_section_records(
+            "<!-- hwiki:compiled:start -->" + match.group(1)
+            + "<!-- hwiki:compiled:end -->")
+        records.append(parsed[0] if parsed else None)
+    if proposal_id:
+        id_matches = [m for m, r in zip(matches, records)
+                      if r and r["proposal_id"] == proposal_id]
+        if id_matches:
+            return id_matches
+        # Legacy sections predate per-section proposal ids.  Only fall back to
+        # a claim when exactly one such section can be meant.
+        legacy = [m for m, r in zip(matches, records)
+                  if r and not r["proposal_id"] and claim
+                  and _section_claim_key(r["claim"]) == _section_claim_key(claim)]
+        return legacy if len(legacy) == 1 else []
+    if not claim:
+        return []
+    claim_matches = [m for m, r in zip(matches, records)
+                     if r and _section_claim_key(r["claim"]) == _section_claim_key(claim)]
+    return claim_matches if len(claim_matches) == 1 else []
+
+
+def _splice_compiled_sections(text: str, matches) -> str:
+    """Delete the selected marker blocks, touching only the seams they leave.
+
+    Blank-line cleanup is local to each seam: content elsewhere on the page is
+    returned byte for byte, so hand-written notes are never reflowed.
+    """
+    segments = []
+    last = 0
+    for match in matches:
+        segments.append(text[last:match.start()])
+        last = match.end()
+    segments.append(text[last:])
+    updated = segments[0]
+    for segment in segments[1:]:
+        if not updated or not segment:
+            updated += segment
+            continue
+        updated = (updated.rstrip(" \t\n") + "\n\n" + segment.lstrip(" \t\n"))
+    return updated.rstrip("\n") + "\n"
+
+
+def _remove_compiled_section(text: str, *, proposal_id: str = "",
+                             claim: str = "") -> Optional[str]:
+    """Remove one matching compiled section; returns None when none matched.
+
+    Deleting the whole page instead would silently destroy every other fact
+    merged into it, so ``forget`` rewrites just the requested section.
+    """
+    matches = list(_COMPILED_SECTION_RE.finditer(text))
+    selected = _select_compiled_sections(matches, proposal_id=proposal_id,
+                                         claim=claim)
+    if not selected:
+        return None
+    updated = _splice_compiled_sections(text, selected)
+    header = re.match(r"\A---\r?\n(.*?)\r?\n---[ \t]*\r?\n", updated, re.DOTALL)
+    if header and re.search(r"^compiled_sections:", header.group(1), re.M):
+        count = len(_COMPILED_SECTION_RE.findall(updated))
+        new_header = re.sub(r"^compiled_sections:.*$",
+                            f"compiled_sections: {count}",
+                            header.group(1), count=1, flags=re.M)
+        updated = f"---\n{new_header}\n---\n" + updated[header.end():]
+    return updated
 
 
 def read_fact_pages(vault_root: Path, memory_rel: Path, max_facts: int = 25) -> List[Dict[str, Any]]:
@@ -612,27 +737,42 @@ def read_fact_pages(vault_root: Path, memory_rel: Path, max_facts: int = 25) -> 
         except OSError:
             continue
         meta = _frontmatter_dict(text)
-        if meta.get("extractor") != "hwiki-extractor" or meta.get("status") == "superseded":
+        if meta.get("extractor") != "hwiki-extractor":
             continue
+        # The page's H1 and each merged section carry independent status: one
+        # `supersede` of a merged claim must not hide the page's other facts,
+        # and superseding the owner must not hide still-live refinements.
+        page_superseded = meta.get("status") == "superseded"
         match = re.search(r"^# (.+)$", text, re.M)
-        facts.append({
-            "claim": match.group(1).strip() if match else meta.get("title", page.stem),
-            "kind": meta.get("kind", "fact"),
-            "peer": meta.get("peer", "user"),
-            "project": meta.get("project", ""),
-            "accepted_at": meta.get("accepted_at", ""),
-            "path": str(page),
-        })
-        # Claims merged into this page by `compile` live as ### sections, not
-        # as the H1. Without this they would be accepted facts that recall can
-        # never see — the one failure mode compile must not introduce.
-        for section in _compiled_sections(text):
+        if not page_superseded:
             facts.append({
-                "claim": section,
+                "claim": match.group(1).strip() if match else meta.get("title", page.stem),
                 "kind": meta.get("kind", "fact"),
                 "peer": meta.get("peer", "user"),
                 "project": meta.get("project", ""),
                 "accepted_at": meta.get("accepted_at", ""),
+                "path": str(page),
+            })
+        # Claims merged into this page by `compile` live as ### sections, not
+        # as the H1. Without this they would be accepted facts that recall can
+        # never see — the one failure mode compile must not introduce.
+        for section in _compiled_section_records(text):
+            if section["superseded"]:
+                continue
+            # Each merged section records its own kind/peer/date; reporting the
+            # owner page's values mislabels the fact during recall injection and
+            # profile rendering. Fall back to the page only for old sections
+            # that predate per-section metadata.
+            section_kind = (section["kind"] if section["kind"] in KIND_PRIORITY
+                            else meta.get("kind", "fact"))
+            section_peer = (section["peer"] if section["peer"] in ("user", "assistant")
+                            else meta.get("peer", "user"))
+            facts.append({
+                "claim": section["claim"],
+                "kind": section_kind,
+                "peer": section_peer,
+                "project": meta.get("project", ""),
+                "accepted_at": section["accepted"] or meta.get("accepted_at", ""),
                 "path": str(page),
             })
     facts.sort(key=lambda f: (KIND_PRIORITY.get(f["kind"], 9), f["accepted_at"]), reverse=True)
@@ -717,21 +857,85 @@ def render_profile(facts: List[Dict[str, Any]], max_chars: int = 3500,
     return "\n".join(lines).rstrip()
 
 
-def mark_superseded_page(page_path, new_claim: str) -> bool:
-    """Tombstone a superseded fact page with a wikilink to its replacement."""
+def mark_superseded_page(page_path, new_claim: str, *, claim: str = "",
+                         proposal_id: str = "") -> bool:
+    """Tombstone a superseded fact and link it to its replacement.
+
+    A page can carry several accepted facts: its H1 plus every ``compile``-merged
+    section. When the superseded row is one of those sections, only that section
+    is marked; tombstoning the whole page would hide the owner and every other
+    refinement from recall and from rebuild.
+    """
     page = Path(page_path) if page_path else None
     if page is None or not page.exists():
         return False
-    text = page.read_text(encoding="utf-8", errors="replace")
-    if "status: auto" in text and "status: superseded" not in text:
-        text = text.replace("status: auto", "status: superseded", 1)
-        slug = slug_for_claim(new_claim)
-        text = text.replace("status: superseded",
-                            f"status: superseded\nsuperseded_by: \"[[{slug}]]\"", 1)
-        text = text.rstrip("\n") + f"\n\n*Superseded by [[{slug}|{new_claim[:80]}]].*\n"
-        page.write_text(text, encoding="utf-8")
+    try:
+        text = page.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    slug = slug_for_claim(new_claim)
+    matches = list(_COMPILED_SECTION_RE.finditer(text))
+    selected = _select_compiled_sections(matches, proposal_id=proposal_id,
+                                         claim=claim)
+    if selected:
+        note = f"*Superseded by [[{slug}|{_one_line(new_claim, 80)}]].*"
+        pieces: List[str] = []
+        last = 0
+        changed = False
+        for match in selected:
+            block = match.group(0)
+            if "*Superseded by" not in block:
+                block = block.replace(
+                    "\n<!-- hwiki:compiled:end -->",
+                    f"\n{note}\n\n<!-- hwiki:compiled:end -->")
+                changed = True
+            pieces.append(text[last:match.start()])
+            pieces.append(block)
+            last = match.end()
+        pieces.append(text[last:])
+        updated = "".join(pieces)
+        written = _atomic_write(page, updated) if changed else True
+        return bool(written and (changed or updated == text) and True)
+    # The row did not match a merged section, so only the page's own claim may
+    # justify tombstoning the file. A caller that passes no identity predates
+    # per-fact provenance and meant "tombstone this page"; honour that only for
+    # a standalone page, since a shared page would lose its merged facts.
+    if not (claim or proposal_id):
+        if matches:
+            return False
+        owner_match = True
+    else:
+        meta = _frontmatter_dict(text)
+        heading = re.search(r"^# (.+)$", text, re.M)
+        owner_claim = (heading.group(1).strip() if heading
+                       else meta.get("title", page.stem))
+        owner_match = ((proposal_id and meta.get("proposal_id") == proposal_id)
+                       or (claim and _section_claim_key(owner_claim)
+                           == _section_claim_key(claim)))
+    if not owner_match:
+        return False
+    if "status: auto" not in text or "status: superseded" in text:
+        return False
+    text = text.replace("status: auto", "status: superseded", 1)
+    text = text.replace("status: superseded",
+                        f"status: superseded\nsuperseded_by: \"[[{slug}]]\"", 1)
+    text = text.rstrip("\n") + f"\n\n*Superseded by [[{slug}|{new_claim[:80]}]].*\n"
+    return bool(_atomic_write(page, text))
+
+
+def _atomic_write(page: Path, text: str) -> bool:
+    """Replace ``page`` atomically; a failed write leaves the original intact."""
+    tmp = page.with_name(page.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(page)
         return True
-    return False
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
 
 
 def load_builtin_entries(memories_dir=None) -> List[Dict[str, str]]:
@@ -911,6 +1115,42 @@ def _db_connection(database):
 
 
 class ProposalStore:
+    @contextmanager
+    def lifecycle_lock(self):
+        """Serialize vault read-modify-write sequences across writers.
+
+        Forget, supersede and compile all read a page, decide, then replace it.
+        Without one lock spanning that sequence two writers can each write a
+        whole-page snapshot and resurrect the other's removed section.  The
+        lock lives beside the SQLite database, which is the shared authority
+        for a vault, and is reentrant within a thread so nested operations
+        (tool -> store.supersede) cannot self-deadlock.
+        """
+        lock_path = str(self.database) + ".lifecycle.lock"
+        state = getattr(_LIFECYCLE_LOCK_STATE, "entry", None)
+        if state and state[0] == lock_path:
+            state[1] += 1
+            try:
+                yield
+            finally:
+                state[1] -= 1
+            return
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            _LIFECYCLE_LOCK_STATE.entry = [lock_path, 1]
+            try:
+                yield
+            finally:
+                _LIFECYCLE_LOCK_STATE.entry = None
+        finally:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
     _NEW_COLUMNS = {
         "embedding": "BLOB",
         "accepted_at": "REAL",
@@ -1119,20 +1359,28 @@ class ProposalStore:
             return cur.rowcount > 0
 
     def supersede(self, new_id, old_id):
-        """Mark an accepted fact superseded by a newer one. Returns (ok, old_row)."""
-        with _db_connection(self.database) as conn:
-            new = conn.execute('SELECT * FROM proposals WHERE id=?', (new_id,)).fetchone()
-            old = conn.execute('SELECT * FROM proposals WHERE id=?', (old_id,)).fetchone()
-            if new is None or old is None or old["status"] != "accepted":
-                return False, None
-            conn.execute(
-                'UPDATE proposals SET status=?, superseded_by=? WHERE id=?',
-                ('superseded', new_id, old_id),
-            )
-            # record lineage on the new fact so recall can show what replaced what
-            conn.execute('UPDATE proposals SET supersedes=? WHERE id=?', (old_id, new_id))
-            updated = conn.execute('SELECT * FROM proposals WHERE id=?', (old_id,)).fetchone()
-            return True, self._row_to_dict(updated)
+        """Mark an accepted fact superseded by a newer accepted one.
+
+        A proposed (unreviewed) replacement is not authority: allowing it to
+        supersede would hide a review-gated fact behind something the user has
+        not accepted. Returns (ok, old_row).
+        """
+        with self.lifecycle_lock():
+            with _db_connection(self.database) as conn:
+                new = conn.execute('SELECT * FROM proposals WHERE id=?', (new_id,)).fetchone()
+                old = conn.execute('SELECT * FROM proposals WHERE id=?', (old_id,)).fetchone()
+                if (new is None or old is None
+                        or new["status"] != "accepted"
+                        or old["status"] != "accepted"):
+                    return False, None
+                conn.execute(
+                    'UPDATE proposals SET status=?, superseded_by=? WHERE id=?',
+                    ('superseded', new_id, old_id),
+                )
+                # record lineage on the new fact so recall can show what replaced what
+                conn.execute('UPDATE proposals SET supersedes=? WHERE id=?', (old_id, new_id))
+                updated = conn.execute('SELECT * FROM proposals WHERE id=?', (old_id,)).fetchone()
+                return True, self._row_to_dict(updated)
 
     def set_page_path(self, proposal_id, page_path):
         with _db_connection(self.database) as conn:
@@ -1149,8 +1397,11 @@ class ProposalStore:
         updated = revoked = skipped = 0
         with _db_connection(self.database) as conn:
             rows = conn.execute(
-                "SELECT id, claim, evidence, page_path FROM proposals "
+                "SELECT id, claim, evidence, peer, page_path FROM proposals "
                 "WHERE status='accepted' AND page_path IS NOT NULL").fetchall()
+        # Several accepted facts can live on one shared page (page H1 plus
+        # compile's merged sections), so parse each page once.
+        parsed: Dict[str, tuple] = {}
         for row in rows:
             page = Path(row["page_path"]) if row["page_path"] else None
             if page is None or not page.exists():
@@ -1160,18 +1411,74 @@ class ProposalStore:
                         (row["id"],))
                 revoked += 1
                 continue
-            try:
-                text = page.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            meta = _frontmatter_dict(text)
-            if meta.get("status") == "superseded":
-                continue
-            match = re.search(r"^# (.+)$", text, re.M)
-            claim = match.group(1).strip() if match else row["claim"]
-            ev_match = re.search(r"^> \*\*Evidence:\*\* (.+)$", text, re.M)
-            evidence = ev_match.group(1).strip() if ev_match else row["evidence"]
-            peer = meta.get("peer", "user")
+            key = str(page)
+            if key not in parsed:
+                try:
+                    text = page.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                meta = _frontmatter_dict(text)
+                match = re.search(r"^# (.+)$", text, re.M)
+                ev_match = re.search(r"^> \*\*Evidence:\*\* (.+)$", text, re.M)
+                parsed[key] = (
+                    meta,
+                    match.group(1).strip() if match else "",
+                    ev_match.group(1).strip() if ev_match else "",
+                    _compiled_section_records(text),
+                )
+            meta, h1, page_evidence, sections = parsed[key]
+            # A merged fact belongs to a ``###`` section, not to the page H1.
+            # Reading the H1 for every row used to rewrite merged claims as the
+            # owner's claim (and then the ID-keyed rebuild could not repair it).
+            owner_id = meta.get("proposal_id", "")
+            is_owner = (owner_id == row["id"]) if owner_id else not sections
+            if is_owner:
+                if meta.get("status") == "superseded":
+                    # A human can tombstone the owner page by hand. The vault
+                    # is authoritative, so mirror that status instead of
+                    # leaving the DB fact accepted (which recall would still
+                    # serve and a later rebuild would "resurrect").
+                    with _db_connection(self.database) as conn:
+                        cur = conn.execute(
+                            "UPDATE proposals SET status='superseded' "
+                            "WHERE id=? AND status='accepted'", (row["id"],))
+                    if cur.rowcount:
+                        updated += 1
+                    continue
+                claim = h1 or row["claim"]
+                evidence = page_evidence or row["evidence"]
+                peer = meta.get("peer", "user")
+            else:
+                section = next(
+                    (s for s in sections
+                     if s["proposal_id"] and s["proposal_id"] == row["id"]),
+                    None)
+                if section is None:
+                    section = next(
+                        (s for s in sections
+                         if s["claim"].strip().lower() == row["claim"].strip().lower()),
+                        None)
+                if section is None:
+                    # The page is still owned by another (live) fact, but this
+                    # row's own section was deleted from it: revoke only this
+                    # fact instead of rewriting it as the owner's claim.
+                    with _db_connection(self.database) as conn:
+                        conn.execute(
+                            "UPDATE proposals SET status='deleted_by_edit' WHERE id=? AND status='accepted'",
+                            (row["id"],))
+                    revoked += 1
+                    continue
+                if section["superseded"]:
+                    # Tombstone written by ``supersede``; trust the vault. Keep
+                    # any lineage already recorded in the DB.
+                    with _db_connection(self.database) as conn:
+                        conn.execute(
+                            "UPDATE proposals SET status='superseded' WHERE id=? AND status='accepted'",
+                            (row["id"],))
+                    continue
+                claim = section["claim"]
+                evidence = section["evidence"] or row["evidence"]
+                peer = section["peer"] or meta.get("peer", "user")
             if peer not in ("user", "assistant"):
                 peer = "user"
             if (claim == row["claim"] and evidence == row["evidence"]
@@ -1222,35 +1529,87 @@ class ProposalStore:
             status = "superseded" if meta.get("status") == "superseded" else "accepted"
             proposal_id = meta.get("proposal_id") or (
                 "vault-" + hashlib.sha256(str(page).encode()).hexdigest()[:16])
-            slug_to_id[page.stem] = proposal_id
             try:
                 accepted_at = datetime.strptime(meta.get("accepted_at", ""), "%Y-%m-%d").replace(
                     tzinfo=timezone.utc).timestamp()
             except (ValueError, TypeError):
                 accepted_at = None
+            # A secret-shaped owner page must not suppress safe compiled
+            # sections: those are independent facts and remain importable.
             if _secret_formed(claim) or _secret_formed(evidence):
                 skipped += 1
-                continue
-            with _db_connection(self.database) as conn:
-                cur = conn.execute(
-                    '''INSERT INTO proposals
-                       (id, dedup_key, status, kind, claim, evidence, session_id, source_hash,
-                        project, created_at, embedding, accepted_at, promoted, page_path, peer)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                       ON CONFLICT(id) DO NOTHING''',
-                    (
-                        proposal_id, self._dedup_key(peer, kind, project, claim), status, kind,
-                        claim, evidence, 'vault-rebuild', '', project,
-                        accepted_at or time.time(), self.embedder.embed(claim),
-                        accepted_at, 1, str(page), peer,
-                    ))
-            # Count actual insertions, not attempts. Reporting every page as
-            # "imported" on a re-run made an idempotent rebuild look like it had
-            # duplicated work (and hid genuine conflicts from callers).
-            if cur.rowcount:
-                imported += 1
             else:
-                skipped += 1
+                slug_to_id[page.stem] = proposal_id
+                slug_to_id[slug_for_claim(claim)] = proposal_id
+                with _db_connection(self.database) as conn:
+                    cur = conn.execute(
+                        '''INSERT INTO proposals
+                           (id, dedup_key, status, kind, claim, evidence, session_id, source_hash,
+                            project, created_at, embedding, accepted_at, promoted, page_path, peer)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(id) DO NOTHING''',
+                        (
+                            proposal_id, self._dedup_key(peer, kind, project, claim), status, kind,
+                            claim, evidence, 'vault-rebuild', '', project,
+                            accepted_at or time.time(), self.embedder.embed(claim),
+                            accepted_at, 1, str(page), peer,
+                        ))
+                # Count actual insertions, not attempts. Reporting every page as
+                # "imported" on a re-run made an idempotent rebuild look like it had
+                # duplicated work (and hid genuine conflicts from callers).
+                if cur.rowcount:
+                    imported += 1
+                else:
+                    skipped += 1
+            # Claims merged into this page by `compile` are accepted facts too,
+            # but they have no page of their own. Without this pass a rebuild
+            # from the vault drops them (the DB "loses" facts the vault still
+            # holds) and they can never be recalled again.
+            for section in _compiled_section_records(text):
+                section_claim = section["claim"]
+                section_evidence = section["evidence"]
+                if _secret_formed(section_claim) or _secret_formed(section_evidence):
+                    skipped += 1
+                    continue
+                section_kind = section["kind"] if section["kind"] in KIND_PRIORITY else kind
+                section_peer = section["peer"] if section["peer"] in ("user", "assistant") else peer
+                section_id = section["proposal_id"] or (
+                    "vault-" + hashlib.sha256(
+                        (str(page) + "\x00" + section_claim).encode()).hexdigest()[:16])
+                section_accepted = accepted_at
+                try:
+                    section_accepted = datetime.strptime(
+                        section["accepted"], "%Y-%m-%d").replace(
+                            tzinfo=timezone.utc).timestamp()
+                except (ValueError, TypeError):
+                    pass
+                # Each section has its own status; a tombstoned owner page no
+                # longer hides still-live refinements, and a section tombstone
+                # must survive a rebuild instead of being revived as accepted.
+                section_status = "superseded" if section["superseded"] else "accepted"
+                # Tombstones name the replacement by claim slug. Register the
+                # section itself so a compiled replacement resolves to its id,
+                # not to the owner page's id (or to nothing at all).
+                slug_to_id[slug_for_claim(section_claim)] = section_id
+                with _db_connection(self.database) as conn:
+                    cur = conn.execute(
+                        '''INSERT INTO proposals
+                           (id, dedup_key, status, kind, claim, evidence, session_id, source_hash,
+                            project, created_at, embedding, accepted_at, promoted, page_path, peer)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(id) DO NOTHING''',
+                        (
+                            section_id,
+                            self._dedup_key(section_peer, section_kind, project, section_claim),
+                            section_status, section_kind, section_claim, section_evidence,
+                            'vault-rebuild', '', project, section_accepted or time.time(),
+                            self.embedder.embed(section_claim), section_accepted, 1,
+                            str(page), section_peer,
+                        ))
+                if cur.rowcount:
+                    imported += 1
+                else:
+                    skipped += 1
         # resolve lineage links between imported pages (second pass)
         for page in pages:
             try:
@@ -1270,9 +1629,113 @@ class ProposalStore:
                     conn.execute(
                         "UPDATE proposals SET status='superseded', superseded_by=? WHERE id=?",
                         (slug_to_id[new_slug], proposal_id))
+                # Merged sections carry their own supersede link, so rebuilding
+                # restores lineage for them too.
+                for section in _compiled_section_records(text):
+                    if not section["superseded_by"]:
+                        continue
+                    section_id = section["proposal_id"] or (
+                        "vault-" + hashlib.sha256(
+                            (str(page) + "\x00" + section["claim"]).encode()).hexdigest()[:16])
+                    conn.execute(
+                        "UPDATE proposals SET status='superseded', superseded_by=? WHERE id=?",
+                        (slug_to_id.get(section["superseded_by"], ""), section_id))
         return {"imported": imported, "skipped": skipped}
 
     def forget(self, proposal_id=None, claim=None):
+        """Serialized revoke; see _forget_locked for the fail-closed rules."""
+        with self.lifecycle_lock():
+            return self._forget_locked(proposal_id=proposal_id, claim=claim)
+
+    def _stale_duplicate_pages(self, row):
+        """Pages other than the row's page that carry the same proposal id.
+
+        An interrupted compile can repoint the row at the owner page before it
+        unlinks the standalone copy.  That leftover page is byte-identical
+        authority to a rebuild, so forget must reconcile it (or refuse) before
+        it may report success.
+        """
+        page_path = row.get("page_path")
+        if not page_path:
+            return []
+        primary = Path(page_path)
+        memory_dir = primary.parent
+        if not memory_dir.is_dir():
+            return []
+        stale = []
+        for page in sorted(memory_dir.glob("*.md")):
+            try:
+                if page.resolve() == primary.resolve():
+                    continue
+                text = page.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return None
+            meta = _frontmatter_dict(text)
+            if str(meta.get("proposal_id") or "") == row["id"]:
+                stale.append((page, text))
+        return stale
+
+    def _remove_stale_duplicates(self, row) -> Optional[str]:
+        """Delete safe stale copies; return an error string when unsafe."""
+        stale = self._stale_duplicate_pages(row)
+        if stale is None:
+            return "could not read a duplicate fact page; refusing to forget"
+        for page, text in stale:
+            sections = _compiled_section_records(text)
+            heading = re.search(r"^# (.+)$", text, re.M)
+            meta = _frontmatter_dict(text)
+            owner_claim = (heading.group(1).strip() if heading
+                           else meta.get("title", page.stem))
+            if (sections
+                    or _section_claim_key(owner_claim)
+                    != _section_claim_key(row["claim"])):
+                return ("a duplicate page for this fact carries other facts; "
+                        "refusing to forget")
+            try:
+                page.unlink()
+            except OSError:
+                return "could not remove a duplicate fact page; refusing to forget"
+        return None
+
+    def _prune_forgotten_sections(self, page) -> Optional[bool]:
+        """Remove sections on ``page`` whose row is already ``deleted_by_edit``.
+
+        A second writer can finish its forget while ours is between reading the
+        page and writing it back: our snapshot then reintroduces a section the
+        other writer removed. The lock prevents that across processes, but this
+        post-write sweep makes the outcome correct even when a writer is
+        interleaved inside our write (or when advisory locks are unavailable).
+        Returns True when the page is clean, None when it cannot be verified.
+        """
+        try:
+            text = page.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        sections = [s for s in _compiled_section_records(text)
+                    if s.get("proposal_id")]
+        if not sections:
+            return True
+        ids = [s["proposal_id"] for s in sections]
+        with _db_connection(self.database) as conn:
+            rows = {r["id"]: r["status"] for r in conn.execute(
+                "SELECT id, status FROM proposals WHERE id IN (%s)"
+                % ",".join("?" * len(ids)), ids)}
+        removed = False
+        for section in sections:
+            if rows.get(section["proposal_id"]) != "deleted_by_edit":
+                # Superseded sections keep their tombstone as lineage history.
+                continue
+            stripped = _remove_compiled_section(
+                text, proposal_id=section["proposal_id"],
+                claim=section["claim"])
+            if stripped is not None:
+                text = stripped
+                removed = True
+        if removed and not _atomic_write(page, text):
+            return None
+        return True
+
+    def _forget_locked(self, proposal_id=None, claim=None):
         """Revoke an accepted fact: tombstone its page (if any) and mark the row
         deleted_by_edit. Requires the exact id OR the exact claim (no fuzzy)."""
         row = None
@@ -1294,13 +1757,66 @@ class ProposalStore:
             return {"ok": False, "error": "provide proposal_id or exact claim"}
         if row["status"] != "accepted":
             return {"ok": False, "error": f"fact is not accepted (status={row['status']})"}
+        duplicate_error = self._remove_stale_duplicates(row)
+        if duplicate_error:
+            return {"ok": False, "error": duplicate_error}
         page_removed = False
         if row.get("page_path") and Path(row["page_path"]).exists():
+            page = Path(row["page_path"])
             try:
-                Path(row["page_path"]).unlink()
-                page_removed = True
+                text = page.read_text(encoding="utf-8", errors="replace")
             except OSError:
-                pass
+                # Without the bytes we cannot prove the page belongs to this
+                # row. Deleting it could destroy unrelated accepted facts, so
+                # fail closed and leave both the page and the row untouched.
+                return {"ok": False,
+                        "error": "could not read the fact page; refusing to delete it"}
+            sections = _compiled_section_records(text)
+            meta = _frontmatter_dict(text)
+            heading = re.search(r"^# (.+)$", text, re.M)
+            owner_claim = (heading.group(1).strip() if heading
+                           else meta.get("title", page.stem))
+            owner_id = str(meta.get("proposal_id") or "")
+            is_owner = ((owner_id == row["id"]) if owner_id
+                        else (not sections
+                              and _section_claim_key(owner_claim)
+                              == _section_claim_key(row["claim"])))
+            # A page can own several accepted facts: its H1 claim plus every
+            # `compile`-merged section. Deleting the file would destroy facts
+            # the caller never asked to forget, so a merged claim is removed
+            # from the page and an owner page that still carries merged facts
+            # is not touched at all.
+            stripped = _remove_compiled_section(text, proposal_id=row["id"],
+                                                claim=row["claim"])
+            if stripped is not None:
+                if not _atomic_write(page, stripped):
+                    return {"ok": False,
+                            "error": "could not rewrite the shared fact page"}
+                # Verify after writing: an interleaved writer may have written
+                # its own page while we were writing, in which case our
+                # snapshot has just resurrected a section it forgot.
+                if self._prune_forgotten_sections(page) is None:
+                    return {"ok": False,
+                            "error": ("could not verify the shared fact page was "
+                                      "reconciled; retry the forget")}
+            elif not is_owner:
+                # The row points at a shared page that no longer contains its
+                # section (stale/renamed/hand-edited). Unlinking here would
+                # delete the owner page and every other fact on it.
+                return {"ok": False,
+                        "error": ("page no longer contains this fact; refusing "
+                                  "to delete a shared page")}
+            elif sections:
+                return {"ok": False,
+                        "error": ("page also owns compiled facts; forget those first "
+                                  "so one forget cannot delete accepted facts")}
+            else:
+                try:
+                    page.unlink()
+                    page_removed = True
+                except OSError:
+                    return {"ok": False,
+                            "error": "could not delete the fact page"}
         with _db_connection(self.database) as conn:
             conn.execute("UPDATE proposals SET status='deleted_by_edit' WHERE id=?", (row["id"],))
         return {"ok": True, "forgot": row["claim"], "page_removed": page_removed}

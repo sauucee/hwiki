@@ -28,6 +28,7 @@ from .facts import (
     load_builtin_entries, read_fact_pages, render_profile, write_fact_page,
     mark_superseded_page, write_session_diary, append_audit_entry,
     write_fact_canvas, resolve_vault, _tokens, _cosine_bytes,
+    _atomic_write, _remove_compiled_section, _section_claim_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -353,6 +354,32 @@ class FactsEngine:
             logger.exception("facts: promote failed for %s", proposal_id)
             return None
 
+    def _fact_page_visible(self, proposal) -> bool:
+        """Whether the proposal's claim is currently readable from its page.
+
+        Supersede must not hide an accepted fact behind a replacement that
+        exists only in the database: if the replacement page was never written
+        (or was lost), the next vault rebuild would have no authority for it.
+        """
+        page_path = str(proposal.get("page_path") or "")
+        claim = str(proposal.get("claim") or "").strip()
+        if not page_path or not claim:
+            return False
+        target = Path(page_path)
+        if not target.exists():
+            return False
+        try:
+            target = target.resolve()
+            for fact in read_fact_pages(self.vault_root, self.memory_rel,
+                                        max_facts=100000):
+                if (Path(fact["path"]).resolve() == target
+                        and _section_claim_key(fact["claim"])
+                        == _section_claim_key(claim)):
+                    return True
+        except Exception:
+            logger.debug("facts: page visibility check failed", exc_info=True)
+        return False
+
     def _compile_enabled(self) -> bool:
         """Whether this engine may merge accepted facts into owner pages."""
         return bool(self.config.get("compile_enabled", True))
@@ -395,6 +422,17 @@ class FactsEngine:
             return 0
 
     def _compile_page_path(self, proposal, own_page) -> bool:
+        """Serialize compile's owner-merge-repoint-unlink sequence.
+
+        Two writers compiling/forgetting the same owner page must not each
+        write a whole-page snapshot: the later one would resurrect a section
+        the earlier one removed. The lock is reentrant, so compile invoked
+        from an already-locked supersede/promote flow does not deadlock.
+        """
+        with self.store().lifecycle_lock():
+            return self._compile_page_path_locked(proposal, own_page)
+
+    def _compile_page_path_locked(self, proposal, own_page) -> bool:
         """Merge ``proposal`` into an existing owner page, if one qualifies.
 
         On success the standalone page is removed and lineage repointed, so the
@@ -424,17 +462,33 @@ class FactsEngine:
         )
         if not result.merged:
             return False
-        # The claim now lives in the owner page's compiled section.
+        # Repoint the DB before deleting the standalone page. If repointing
+        # fails, keep the standalone as the authoritative copy (and roll back
+        # the just-added section when possible) so a later sync cannot revoke
+        # a fact whose page_path would point at a file compile already removed.
+        try:
+            self.store().set_page_path(proposal["id"], owner["path"])
+        except Exception:
+            logger.debug("facts: could not repoint page_path", exc_info=True)
+            try:
+                owner_page = Path(owner["path"])
+                text = owner_page.read_text(encoding="utf-8", errors="replace")
+                stripped = _remove_compiled_section(
+                    text, proposal_id=str(proposal.get("id") or ""))
+                if stripped is not None:
+                    _atomic_write(owner_page, stripped)
+            except Exception:
+                logger.debug("facts: could not roll back merged section",
+                             exc_info=True)
+            return False
+        # The claim now lives in the owner page's compiled section and the DB
+        # points there, so the standalone page is redundant.
         try:
             own = Path(own_page)
             if own.exists() and own.resolve() != Path(owner["path"]).resolve():
                 own.unlink()
         except OSError:
             logger.debug("facts: could not remove merged standalone page", exc_info=True)
-        try:
-            self.store().set_page_path(proposal["id"], owner["path"])
-        except Exception:
-            logger.debug("facts: could not repoint page_path", exc_info=True)
         self._compiled_pages[proposal["id"]] = owner["path"]
         try:
             catalog_store = self._catalog_store()
@@ -894,17 +948,54 @@ class FactsEngine:
             new_id, old_id = args.get("proposal_id"), args.get("supersede_id")
             if not new_id or not old_id:
                 return tool_error("need proposal_id (new fact) and supersede_id (old fact)")
-            ok, old = store.supersede(new_id, old_id)
-            if not ok:
-                return tool_error("supersede failed: old fact must exist and be accepted")
-            new = store.get(new_id)
-            if not new.get("page_path"):
-                self._promote(new_id)
-            tombstoned = mark_superseded_page(old.get("page_path"), new["claim"])
-            self._audit(f"superseded \"{old['claim'][:80]}\" with \"{new['claim'][:80]}\"")
-            self._refresh_canvas()
-            return json.dumps({"success": True, "superseded": old_id, "by": new_id,
-                               "old_page_tombstoned": tombstoned})
+            # One critical section spans read -> promote -> tombstone -> commit.
+            # A concurrent forget/compile on the same owner page must not be
+            # overwritten by this flow's stale snapshot, and every refusal below
+            # must leave both the vault and the DB untouched.
+            with store.lifecycle_lock():
+                try:
+                    old = store.get(old_id)
+                    new = store.get(new_id)
+                except ValueError:
+                    return tool_error("supersede failed: fact not found")
+                if old.get("status") != "accepted":
+                    return tool_error("supersede failed: old fact must be accepted")
+                if new.get("status") != "accepted":
+                    return tool_error(
+                        "supersede failed: replacement must be accepted before it "
+                        "can supersede an accepted fact")
+                if not self._fact_page_visible(new):
+                    # An accepted fact should already have a page; promotion is
+                    # idempotent and repairs a page lost after acceptance.
+                    self._promote(new_id)
+                    new = store.get(new_id)
+                if not self._fact_page_visible(new):
+                    return tool_error(
+                        "supersede failed: replacement is not visible in the vault; "
+                        "no database change was made")
+                # Tombstone the vault first. If that write fails, leave the DB
+                # accepted: committing the DB anyway would let the next rebuild
+                # revive the old fact from its still-live page.
+                old_page = old.get("page_path")
+                tombstoned = True
+                if old_page and Path(old_page).exists():
+                    # Pass the identity of the fact being superseded: when it is a
+                    # `compile`-merged section, only that section may be tombstoned,
+                    # otherwise one supersede hides every fact on the shared page.
+                    tombstoned = mark_superseded_page(old_page, new["claim"],
+                                                      claim=old.get("claim", ""),
+                                                      proposal_id=old_id)
+                    if not tombstoned:
+                        return tool_error(
+                            "supersede failed: could not tombstone the vault page; "
+                            "no database change was made")
+                ok, old = store.supersede(new_id, old_id)
+                if not ok:
+                    return tool_error("supersede failed: old fact must exist and be accepted")
+                self._audit(f"superseded \"{old['claim'][:80]}\" with \"{new['claim'][:80]}\"")
+                self._refresh_canvas()
+                return json.dumps({"success": True, "superseded": old_id, "by": new_id,
+                                   "old_page_tombstoned": tombstoned})
 
         if tool_name == "memory_forget":
             if read_only:
