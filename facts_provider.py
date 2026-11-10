@@ -647,18 +647,21 @@ class FactsEngine:
 
     # -- extraction (side-question window) ----------------------------------
 
-    def _ask_for_facts(self, ctx, token, prompt):
+    def _ask_for_facts(self, ctx, token, prompt, conversation=""):
         """Run the extraction prompt and return its raw text, or None.
 
         Preferred path is ``ctx.side_question`` with the turn's token: it reuses the
-        session's warm cache and knows the whole turn. But the host only issues that
-        token to plugins the plugin manager reports as ``enabled``, and a memory
-        provider is an *exclusive* plugin that is never enabled — it is activated by
-        ``memory.provider`` instead. So the token is always None here, and relying on
-        it alone means extraction never runs.
+        session's warm cache and already knows the turn, so ``prompt`` (the
+        instructions) is all it needs.
 
-        ``ctx.llm`` is the host-owned facade that needs no per-turn lease. It is a
-        fresh call rather than a cache hit, so it is used only when there is no token.
+        But the host only issues that token to plugins the plugin manager reports as
+        ``enabled``, and a memory provider is an *exclusive* plugin that is never
+        enabled — it is activated by ``memory.provider`` instead. So the token is
+        always None here, and relying on it alone means extraction never runs.
+
+        ``ctx.llm`` needs no per-turn lease, but it also has no conversation context:
+        the instructions must be the system message and the conversation the user
+        message, or the model just answers the text as chat.
         """
         if token:
             try:
@@ -669,26 +672,34 @@ class FactsEngine:
         llm = getattr(ctx, "llm", None)
         if llm is None:
             return None
+        # Which provider/model answers is configuration, not a constant: the host's
+        # default model may be unreachable (a 401 from a relay, a responses-only model
+        # behind /chat/completions), and a hardcoded provider would silently rot.
+        cfg_llm = dict(self.config.get("extraction_llm") or {})
+        messages = [{"role": "system", "content": prompt}]
+        if conversation:
+            messages.append({"role": "user", "content": conversation})
         try:
             result = llm.complete(
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=800, temperature=0.0,
+                messages=messages,
+                provider=cfg_llm.get("provider"), model=cfg_llm.get("model"),
+                max_tokens=int(cfg_llm.get("max_tokens") or 800), temperature=0.0,
                 purpose="hwiki.fact-extraction")
             return getattr(result, "text", None) or None
         except Exception as exc:
             logger.warning("facts: ctx.llm extraction call failed: %s", exc)
             return None
 
-    def _propose_facts(self, ctx, token, prompt, user_message, session_id, project):
+    def _propose_facts(self, ctx, token, prompt, user_message, session_id, project, conversation=""):
         store = self.store()
-        result = self._ask_for_facts(ctx, token, prompt)
+        result = self._ask_for_facts(ctx, token, prompt, conversation)
         if not result:
             return None
         parsed = _parse_json_array(result)
         if isinstance(parsed, list):
             parsed = {"facts": parsed}
         if not isinstance(parsed, dict):
-            logger.warning("facts: failed to parse extraction result")
+            logger.warning("facts: failed to parse extraction result: %r", (result or "")[:400])
             return None
         for fact in parsed.get("facts") or []:
             if isinstance(fact, dict) and all(k in fact for k in ("kind", "claim", "evidence")):
@@ -809,7 +820,8 @@ class FactsEngine:
                     if hints:
                         prompt += _FEEDBACK_GUIDANCE_HEADER.format(hints=hints)
                     parsed = self._propose_facts(ctx, side_question_token, prompt,
-                                                 user_message, session_id, project)
+                                                 user_message, session_id, project,
+                                                 conversation="\n".join(blob))
                     if parsed and parsed.get("summary"):
                         state["summary"] = str(parsed["summary"])[:600]
                     elif parsed is None:
@@ -828,8 +840,18 @@ class FactsEngine:
                         prompt += ("\n\nEarlier turns from this session that were not yet processed "
                                    "(extract durable facts from these too):\n"
                                    + "\n".join(f"- {t[:800]}" for t in deferred))
+                    # The side-question path sees the session directly; ctx.llm does not,
+                    # so hand it the recent turns or it answers the text as chat.
+                    convo, convo_used = [], 0
+                    for message in (kwargs.get("conversation_history") or [])[-40:]:
+                        line = f"{message.get('role', '')}: {str(message.get('content', ''))[:1500]}"
+                        if convo_used + len(line) > REVIEW_HISTORY_BUDGET_CHARS:
+                            break
+                        convo.append(line)
+                        convo_used += len(line)
                     parsed = self._propose_facts(ctx, side_question_token, prompt,
-                                                 user_message, session_id, project)
+                                                 user_message, session_id, project,
+                                                 conversation="\n".join(convo))
                     if parsed is None:
                         self._requeue(state, deferred, user_message)
             except Exception:
