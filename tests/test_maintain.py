@@ -72,7 +72,8 @@ class JobTests(_Vault):
     def test_tick_reports_every_job(self):
         report = self.tick()
         names = [job.name for job in report.jobs]
-        self.assertEqual(names, ["heal", "conflicts", "duplicates", "questions", "artifacts"])
+        self.assertEqual(names, ["heal", "conflicts", "duplicates", "questions",
+                                 "artifacts", "stats"])
 
     def test_negation_contradiction_is_found(self):
         self.accept("Deploys are allowed on Fridays")

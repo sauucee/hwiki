@@ -229,6 +229,8 @@ def _cmd_maintain(as_json: bool = False, dry_run: bool = False,
         store.root,
         Path(store.memory_dir),
         embedder=getattr(facts_store, "embedder", None),
+        index_backend=_backend,
+        config=config,
         budget_ms=budget_ms or int((config.get("maintenance") or {}).get(
             "budget_ms", DEFAULT_BUDGET_MS)),
         write=not dry_run,

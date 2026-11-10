@@ -332,6 +332,7 @@ def _accepted_claims(store, limit: int = MAX_FACTS_SWEPT) -> List[str]:
 
 
 def run_maintenance(store, vault_root, memory_rel, *, embedder=None,
+                    index_backend=None, config=None,
                     budget_ms: int = DEFAULT_BUDGET_MS, write: bool = True,
                     question_buffer: Optional[QuestionBuffer] = None,
                     now: Optional[datetime] = None) -> MaintenanceReport:
@@ -475,6 +476,67 @@ def run_maintenance(store, vault_root, memory_rel, *, embedder=None,
         artifacts.skipped = f"error: {exc}"
     report.jobs.append(artifacts)
 
+    # -- 6. stats ----------------------------------------------------------
+    # Rewrite the generated metrics block on any page that opted in with markers.
+    # Prose numbers rot; this one is regenerated, so it cannot. Pages without
+    # markers are never touched (see stats.replace_stats_block).
+    stats_job = JobResult("stats")
+    if not remaining():
+        stats_job.skipped = "budget"
+    else:
+        try:
+            from .stats import measure_stats, render_stats_block, replace_stats_block
+        except ImportError:  # pragma: no cover - loaded as a top-level module
+            try:
+                from stats import (  # type: ignore
+                    measure_stats, render_stats_block, replace_stats_block)
+            except ImportError:
+                measure_stats = None
+        if measure_stats is None:
+            stats_job.skipped = "stats module unavailable"
+        elif not write:
+            stats_job.ran = True
+            stats_job.notes.append("would refresh generated stats blocks")
+        else:
+            # The tip is a git read (fast). The test count is a full suite run
+            # (minutes), so it is opt-in via config and reported as unknown until
+            # someone asks — the block must never carry a stale passing count.
+            stats_cfg = (config or {}).get("stats") or {}
+            run_tests = bool(stats_cfg.get("run_tests", False))
+            measured = measure_stats(vault_root, memory_rel=memory_rel,
+                                     repo_dir=_stats_repo_dir(),
+                                     store=store, backend=index_backend,
+                                     run_tests=run_tests,
+                                     timeout_s=int(stats_cfg.get("test_timeout_s",
+                                                                 600)))
+            block = render_stats_block(
+                pages=measured.get("pages"), chunks=measured.get("chunks"),
+                facts=measured.get("facts"), tip=measured.get("tip"),
+                tests=measured.get("tests"))
+            rewritten = 0
+            for page in sorted(vault_root.rglob("*.md")):
+                try:
+                    text = page.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if "<!-- hwiki:stats:start -->" not in text:
+                    continue  # not opted in
+                updated = replace_stats_block(text, block)
+                if updated == text:
+                    continue  # byte-identical: do not touch the file
+                try:
+                    from .facts import _atomic_write
+                except ImportError:  # pragma: no cover
+                    _atomic_write = None
+                if _atomic_write is not None and _atomic_write(page, updated):
+                    rewritten += 1
+            stats_job.ran = True
+            stats_job.count = rewritten
+            stats_job.notes.append(
+                f"refreshed {rewritten} generated stats block(s)"
+                if rewritten else "generated stats blocks current")
+    report.jobs.append(stats_job)
+
     report.elapsed_ms = int((time.monotonic() - started) * 1000)
 
     # -- persist the report ------------------------------------------------
@@ -591,6 +653,21 @@ def _wiki_for_artifacts(store, vault_root: Path, memory_rel: Path):
         return WikiStore(vault_root, memory_dir=str(memory_rel))
     except Exception:
         return None
+
+
+def _stats_repo_dir() -> Optional[Path]:
+    """Where the plugin's own git checkout lives, for the tip and test count.
+
+    ``None`` when the plugin was not installed as a checkout (a pip install has no
+    ``.git``), which makes the tip legitimately unknown rather than wrong.
+    """
+    candidate = Path(__file__).resolve().parent
+    try:
+        if (candidate / ".git").exists():
+            return candidate
+    except OSError:
+        pass
+    return None
 
 
 def _artifact_findings(store, vault_root: Path, memory_rel: Path) -> List[str]:
