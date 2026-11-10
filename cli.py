@@ -22,6 +22,7 @@ import sqlite3
 import sys
 from datetime import date
 from pathlib import Path
+from typing import Dict, List
 
 from .config import CONFIG_FILENAME, build_runtime, load_config
 from .catalog import append_log, read_log_tail, write_index
@@ -285,6 +286,27 @@ def _cmd_lint(as_json: bool = False, show_info: bool = False,
         print(json.dumps(to_dict(report), indent=2, ensure_ascii=False))
         return
     dangling = store.dangling_links()
+    # A link to a page that exists on disk but is excluded from the index is not
+    # broken: a human can open it in Obsidian, only recall cannot reach it. Reporting
+    # those as dangling made every `exclude`d page (Hermes/Templates/**) a permanent
+    # finding no edit could clear. Split them out so the dangling list stays
+    # actionable.
+    try:
+        from .lint import target_exists_on_disk
+    except ImportError:  # pragma: no cover - direct-module CLI use
+        from lint import target_exists_on_disk  # type: ignore
+    unindexed: Dict[str, List[str]] = {}
+    if dangling:
+        still_missing: Dict[str, List[str]] = {}
+        for source, targets in dangling.items():
+            keep, skipped = [], []
+            for target in targets:
+                (skipped if target_exists_on_disk(store.root, target) else keep).append(target)
+            if keep:
+                still_missing[source] = keep
+            if skipped:
+                unindexed[source] = skipped
+        dangling = still_missing
     _out, backlinks = store.link_graph(key="path")
     orphans = [p.path for p in store.iter_pages()
                if not backlinks.get(p.path) and p.path != "index.md"]
@@ -297,6 +319,12 @@ def _cmd_lint(as_json: bool = False, show_info: bool = False,
             print(f"    {source} -> {', '.join(targets)}")
     else:
         print("  Dangling wikilinks: none")
+    if unindexed:
+        total = sum(len(v) for v in unindexed.values())
+        print(f"  Links to pages on disk but outside the index ({total}) — "
+              "openable by a human, not recallable:")
+        for source, targets in sorted(unindexed.items()):
+            print(f"    {source} -> {', '.join(targets)}")
     print(f"  Orphan pages ({len(orphans)}): {', '.join(sorted(orphans)[:20]) or 'none'}")
     print(f"  Memory findings: {counts['error']} error(s), "
           f"{counts['warn']} warning(s), {counts['info']} note(s)")

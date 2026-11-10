@@ -18,6 +18,7 @@ Design rules:
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,30 @@ MAX_PAGE_CHARS = 24_000
 _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n", re.S)
 _H1_RE = re.compile(r"^# (.+)$", re.M)
 _LINK_RE = re.compile(r"\[\[([^\]|#]+)")
+
+
+def target_exists_on_disk(root: Path, reference: str) -> bool:
+    """Does ``reference`` name a real ``.md`` file under ``root``?
+
+    Existence only — deliberately indifferent to ``include``/``exclude``/``untrusted``,
+    because this answers "would a human following this link in Obsidian see a page?".
+    The provider's *servable* set is a different question, asked by ``WikiStore``.
+
+    Confined to the vault root through the store's own helper, so a crafted ``../``
+    target cannot turn this into a filesystem oracle. Never raises.
+    """
+    from .store import _stat_beneath  # lazy: leaf-only at import time
+
+    candidate = str(reference or "").strip().lstrip("/")
+    if not candidate:
+        return False
+    for rel in {candidate, candidate + ".md", f"{candidate.rstrip('/')}/index.md"}:
+        try:
+            if _stat_beneath(root, root / rel) is not None:
+                return True
+        except (ValueError, OSError):
+            continue
+    return False
 
 
 @dataclass(frozen=True)
@@ -143,8 +168,10 @@ def lint_memory(store, *, memory_dir: Optional[Path] = None,
     mem = Path(memory_dir) if memory_dir is not None else (root / store.memory_dir)
     pages = _memory_pages(mem)
     report.pages_checked = len(pages)
-    if not pages:
-        return report
+    # No early return on an empty memory zone: the catalog, orphan and answer checks
+    # below are about the *vault*, not the zone. Returning here meant `maintain`'s
+    # artifacts job reported "catalogs current" on any vault whose memory zone was
+    # still empty — exactly the state a fresh install starts in.
 
     # Page identity, in the same tiers ``WikiStore.resolve_page`` uses: an exact
     # root-relative path, a unique case-insensitive path, a filename slug, then a
@@ -173,6 +200,7 @@ def lint_memory(store, *, memory_dir: Optional[Path] = None,
             return resolved_cache[reference]
 
         identity.resolver = _resolve
+        identity.on_disk = lambda reference: target_exists_on_disk(root, reference)
         for page in all_pages:
             identity.add(page)
             # every indexed page is a possible source of an inbound link, not just
@@ -214,8 +242,20 @@ def lint_memory(store, *, memory_dir: Optional[Path] = None,
         # to it (`continue`), which used to hide its dangling links entirely.
         for link in _wikilink_targets(text):
             if identity.known and identity.resolve(link) is None:
+                if identity.exists_unindexed(link):
+                    # The target is a real file a human can open in Obsidian, but
+                    # `include`/`exclude` keep it out of the index, so the provider
+                    # cannot serve it. That is a navigation gap, not a broken link:
+                    # reporting it as an ERROR made every `exclude`d page a permanent
+                    # unfixable finding (Hermes/Templates/** produced 4 of 4 errors
+                    # on the live vault).
+                    report.add("link.unindexed", WARN, rel,
+                               f"[[{link}]] exists but is excluded from the index; "
+                               "a human can open it, recall cannot")
+                    continue
                 report.add("link.dangling", ERROR, rel,
                            f"[[{link}]] does not resolve to any page")
+
 
         meta = _frontmatter(text)
         is_extractor_page = meta.get("extractor") == EXTRACTOR_MARKER
@@ -285,6 +325,7 @@ class _Identity:
 
     def __init__(self) -> None:
         self.resolver = None  # injectable: lint_memory passes WikiStore._resolve_in
+        self.on_disk = None  # Optional[Callable[[str], bool]]: exists outside the index?
         self.by_path: Dict[str, set] = {}
         self.by_stem: Dict[str, set] = {}
         self.folded_path: Dict[str, set] = {}
@@ -338,6 +379,34 @@ class _Identity:
         if hits is not None and len(hits) == 1:
             return next(iter(hits))
         return None
+
+    def exists_unindexed(self, target: str) -> bool:
+        """True when ``target`` names a real file the index deliberately omits.
+
+        ``include``/``exclude``/``untrusted_dirs`` decide what the provider may
+        serve, not what exists in the vault. A link to an excluded but present page
+        is followable by a human in Obsidian and unfollowable by recall — a
+        different fact from a link to nothing, and one a caller can act on
+        (widen ``include``, or stop linking it from indexed pages).
+
+        Only called after :meth:`resolve` returned ``None``, so it never overrides
+        a page the store can actually open. Traversal and absolute paths are not
+        "unindexed"; they are refused, and stay dangling.
+        """
+        from .store import _is_traversal  # lazy: this module stays leaf-only
+
+        raw = (target or "").strip()
+        if raw.startswith("[[") and raw.endswith("]]"):
+            raw = raw[2:-2]
+        raw = raw.split("|", 1)[0].split("#", 1)[0].strip()
+        if not raw or _is_traversal(raw) or os.path.isabs(raw):
+            return False
+        if self.on_disk is None:
+            return False
+        try:
+            return bool(self.on_disk(raw))
+        except Exception:  # pragma: no cover - a probe must never break lint
+            return False
 
     def _tier_hits(self, target: str) -> Optional[set]:
         """Candidate paths for the first non-empty tier, or ``None`` when all are empty."""

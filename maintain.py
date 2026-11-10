@@ -155,6 +155,18 @@ def _claim_sort_key(fact: Dict[str, Any]) -> str:
     return str(fact.get("accepted_at") or "")
 
 
+def _defuse_links(text: str) -> str:
+    """Render ``[[x]]`` as ``\\[\\[x\\]\\]`` so the report cannot link anything.
+
+    The report quotes lint findings verbatim, and findings quote the wikilink the
+    reader should fix. Written back unescaped, the report's own output becomes
+    real wikilinks, which the next lint pass reads as dangling — one run creating
+    the next run's errors, forever. Escaping keeps the text readable and makes the
+    page link-neutral. Regression: `tests/test_maintain_artifacts.py`.
+    """
+    return (text or "").replace("[[", "\\[\\[").replace("]]", "\\]\\]")
+
+
 def render(report: MaintenanceReport, *, memory_dir: Optional[Path] = None) -> str:
     """The derived page. Regenerated every tick; never contains a `# claim` heading."""
     stamp = report.ran_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -193,8 +205,8 @@ def render(report: MaintenanceReport, *, memory_dir: Optional[Path] = None) -> s
                      "about the disagreement instead of silently trusting either side.")
         lines.append("")
         for a, b, score in report.conflicts:
-            lines.append(f"- **{a}**")
-            lines.append(f"  vs **{b}**  _(score {score:.2f})_")
+            lines.append(f"- **{_defuse_links(a)}**")
+            lines.append(f"  vs **{_defuse_links(b)}**  _(score {score:.2f})_")
     else:
         lines.append("None found.")
     lines.append("")
@@ -203,8 +215,8 @@ def render(report: MaintenanceReport, *, memory_dir: Optional[Path] = None) -> s
     lines.append("")
     if report.duplicates:
         for a, b, score in report.duplicates:
-            lines.append(f"- **{a}**")
-            lines.append(f"  ~ **{b}**  _(score {score:.2f})_")
+            lines.append(f"- **{_defuse_links(a)}**")
+            lines.append(f"  ~ **{_defuse_links(b)}**  _(score {score:.2f})_")
     else:
         lines.append("None found.")
     lines.append("")
@@ -216,7 +228,7 @@ def render(report: MaintenanceReport, *, memory_dir: Optional[Path] = None) -> s
                      "rather than assuming or re-deriving.")
         lines.append("")
         for question in report.questions:
-            lines.append(f"- {question}")
+            lines.append(f"- {_defuse_links(question)}")
     else:
         lines.append("None recorded.")
     lines.append("")
@@ -225,7 +237,7 @@ def render(report: MaintenanceReport, *, memory_dir: Optional[Path] = None) -> s
         lines.append("## Stale artifacts")
         lines.append("")
         for item in report.stale_artifacts:
-            lines.append(f"- {item}")
+            lines.append(f"- {_defuse_links(item)}")
         lines.append("")
 
     return "\n".join(lines)
@@ -442,7 +454,7 @@ def run_maintenance(store, vault_root, memory_rel, *, embedder=None,
     # -- 5. artifacts ------------------------------------------------------
     artifacts = JobResult("artifacts")
     try:
-        stale = _artifact_findings(store, vault_root, memory_rel)
+        stale = _artifact_findings(store, vault_root, memory_rel, config=config)
         report.stale_artifacts = stale
         if stale:
             try:
@@ -452,7 +464,7 @@ def run_maintenance(store, vault_root, memory_rel, *, embedder=None,
                     from catalog import write_index  # type: ignore
                 except ImportError:
                     write_index = None
-            wiki = _wiki_for_artifacts(store, vault_root, memory_rel)
+            wiki = _wiki_for_artifacts(store, vault_root, memory_rel, config=config)
             if not write:
                 artifacts.ran = True
                 artifacts.count = len(stale)
@@ -641,13 +653,20 @@ def _pair_relation(a: str, b: str, embedder=None, toks_a=None, toks_b=None) -> s
     return ""
 
 
-def _wiki_for_artifacts(store, vault_root: Path, memory_rel: Path):
+def _wiki_for_artifacts(store, vault_root: Path, memory_rel: Path,
+                        config: Optional[Dict[str, Any]] = None):
     """The tick's ``store`` is the facts store; catalogs need the *vault* store.
 
     ``lint_memory`` and ``write_index`` both want a WikiStore (root + memory_dir). Passing
     the facts store made lint raise, the exception was swallowed, and the artifacts job
     reported "catalogs current" on every tick — including on a vault whose index was
     visibly stale.
+
+    ``include``/``exclude``/``untrusted_dirs`` come from the resolved config. Building
+    the store on its defaults (``exclude=()``) indexed pages the live provider hides,
+    so ``catalog.entry_missing`` demanded the index list ``Hermes/Templates/**`` and
+    ``Hermes/Inbox.md`` — pages the catalog is configured never to list. The artifacts
+    job then reported a stale catalog on every tick and could never clear it.
     """
     if hasattr(store, "iter_pages") and hasattr(store, "memory_dir"):
         return store
@@ -658,8 +677,19 @@ def _wiki_for_artifacts(store, vault_root: Path, memory_rel: Path):
             from store import WikiStore  # type: ignore
         except ImportError:
             return None
+    section = (config or {})
+    include = section.get("include") or ()
+    exclude = section.get("exclude") or ()
+    untrusted = section.get("untrusted_dirs")
+    kwargs: Dict[str, Any] = {"memory_dir": str(memory_rel)}
+    if include:
+        kwargs["include"] = list(include)
+    if exclude:
+        kwargs["exclude"] = list(exclude)
+    if untrusted is not None:
+        kwargs["untrusted_dirs"] = list(untrusted)
     try:
-        return WikiStore(vault_root, memory_dir=str(memory_rel))
+        return WikiStore(vault_root, **kwargs)
     except Exception:
         return None
 
@@ -679,7 +709,8 @@ def _stats_repo_dir() -> Optional[Path]:
     return None
 
 
-def _artifact_findings(store, vault_root: Path, memory_rel: Path) -> List[str]:
+def _artifact_findings(store, vault_root: Path, memory_rel: Path,
+                       config: Optional[Dict[str, Any]] = None) -> List[str]:
     findings: List[str] = []
     try:
         from .lint import lint_memory
@@ -688,7 +719,7 @@ def _artifact_findings(store, vault_root: Path, memory_rel: Path) -> List[str]:
             from lint import lint_memory  # type: ignore
         except ImportError:
             return findings
-    wiki = _wiki_for_artifacts(store, vault_root, memory_rel)
+    wiki = _wiki_for_artifacts(store, vault_root, memory_rel, config=config)
     if wiki is None:
         return findings
     try:
