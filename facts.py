@@ -593,6 +593,31 @@ _COMPILED_SECTION_RE = re.compile(
     r"<!-- hwiki:compiled:start -->(.*?)<!-- hwiki:compiled:end -->", re.DOTALL)
 
 
+def _unstor_heading_truncation(page_claim: str, stored_claim: str) -> str:
+    """Return ``stored_claim`` when the page copy is only its truncated heading.
+
+    ``compile`` renders a merged claim as a ``###`` heading capped at
+    ``compile._MAX_CLAIM`` characters, so a longer claim is stored shortened. A
+    later ``sync_from_vault`` reads the heading back and, because the vault is
+    authoritative, would write that shortened text over the full claim — losing
+    the tail permanently, with nothing recording that anything was cut.
+
+    A heading that is a strict prefix of the stored claim, and is at the cap, is
+    that truncation rather than an edit: keep the full claim. Any other
+    difference is a genuine hand edit and is honoured. Comparing against the
+    stored claim (not a fixed length) keeps this correct whatever the cap is.
+    """
+    page_claim = (page_claim or "").strip()
+    stored_claim = (stored_claim or "").strip()
+    if not page_claim or not stored_claim:
+        return page_claim
+    if len(page_claim) >= len(stored_claim):
+        return page_claim  # same length or longer: not a truncation
+    if stored_claim.startswith(page_claim):
+        return stored_claim
+    return page_claim
+
+
 def _compiled_section_records(text: str) -> List[Dict[str, str]]:
     """Claim and metadata of every ``compile``-merged section on a page.
 
@@ -1481,6 +1506,7 @@ class ProposalStore:
                 peer = section["peer"] or meta.get("peer", "user")
             if peer not in ("user", "assistant"):
                 peer = "user"
+            claim = _unstor_heading_truncation(claim, row["claim"])
             if (claim == row["claim"] and evidence == row["evidence"]
                     and peer == (row["peer"] or "user")):
                 continue

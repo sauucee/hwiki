@@ -970,6 +970,16 @@ class FactsEngine:
                     self._promote(new_id)
                     new = store.get(new_id)
                 if not self._fact_page_visible(new):
+                    # ``_promote`` above may have written this row and put a page on
+                    # disk. Saying "no database change was made" then is false, and a
+                    # caller who retries would be reasoning about state that moved.
+                    changed = bool(new.get("page_path")) or bool(new.get("promoted"))
+                    if changed:
+                        return tool_error(
+                            "supersede failed: replacement is still not visible in the "
+                            f"vault after promoting it; it was written to "
+                            f"{new.get('page_path')} and left accepted, and neither "
+                            "fact was superseded")
                     return tool_error(
                         "supersede failed: replacement is not visible in the vault; "
                         "no database change was made")
