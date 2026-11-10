@@ -233,7 +233,8 @@ class FactsEngine:
             self._store = ProposalStore(str(data_dir / "facts.sqlite"),
                                         embedder=Embedder(
                                             mode=mode,
-                                            cache_size=embeddings.get("cache_size")))
+                                            cache_size=embeddings.get("cache_size")),
+                                        config=self.config)
             self._heal_from_vault()
         return self._store
 

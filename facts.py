@@ -1256,10 +1256,13 @@ class ProposalStore:
     }
 
     def __init__(self, database, embedder: Optional[Embedder] = None, *,
-                 answerability: Optional[bool] = None):
+                 answerability: Optional[bool] = None, config: Optional[dict] = None):
         self.database = Path(database)
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.embedder = embedder or Embedder()
+        # Operator settings, injected by the provider. Absent means "review
+        # everything", which is the safe default for a memory system.
+        self.config = config or {}
         # Opt-in, default OFF. Env var wins so the behavior suite can toggle the
         # capability without editing a live config file.
         if answerability is None:
@@ -1302,10 +1305,47 @@ class ProposalStore:
             for column, decl in self._NEW_COLUMNS.items():
                 if column not in existing:
                     conn.execute(f"ALTER TABLE proposals ADD COLUMN {column} {decl}")
+            self._reembed_if_mode_changed(conn)
 
     @staticmethod
     def _source_hash(user_text):
         return hashlib.sha256(user_text.encode()).hexdigest()
+
+    def _embedding_signature(self) -> str:
+        """Identify the vector space the stored embeddings live in.
+
+        The two tiers produce different widths — measured on this host: ONNX 384
+        dimensions, hashed n-grams 2048 — and ``_cosine_bytes`` returns 0.0 for a
+        length mismatch. Switching modes without re-embedding therefore makes every
+        stored fact score 0 against every query: matching silently stops working
+        rather than erroring, which is the worst possible failure for a memory
+        system. The signature records dimensions (not bytes) so it reads as what it
+        is.
+        """
+        dims = len(self.embedder.embed("probe")) // 4
+        return f"{getattr(self.embedder, 'mode', 'hash')}:{dims}"
+
+    def _reembed_if_mode_changed(self, conn) -> None:
+        """Re-embed stored claims when the embedding tier changed.
+
+        Runs inside schema setup, so it happens once per process at most, and only
+        when the signature actually differs — a no-op on every normal start.
+        """
+        signature = self._embedding_signature()
+        row = conn.execute("SELECT value FROM meta WHERE key='embedding_sig'").fetchone()
+        previous = row["value"] if row else None
+        if previous == signature:
+            return
+        if previous is not None:
+            # Rewrite every stored vector into the new space, so old facts stay
+            # findable. Without this the mode switch is a silent recall outage.
+            rows = conn.execute("SELECT id, claim FROM proposals").fetchall()
+            for row_ in rows:
+                conn.execute("UPDATE proposals SET embedding=? WHERE id=?",
+                             (self.embedder.embed(row_["claim"]), row_["id"]))
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('embedding_sig', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (signature,))
 
     @staticmethod
     def _dedup_key(peer, kind, project, claim):
@@ -1426,6 +1466,30 @@ class ProposalStore:
                     json.dumps(related), conflict, duplicate_of_builtin, peer,
                 ),
             )
+            # Risk split: a trivial, unflagged fact may skip the queue when the
+            # operator opted in. Everything consequential still waits for a human.
+            try:
+                from .review import classify_risk
+            except ImportError:  # pragma: no cover - loaded as a top-level module
+                try:
+                    from review import classify_risk  # type: ignore
+                except ImportError:
+                    classify_risk = None
+            if classify_risk is not None and getattr(self, "config", None):
+                # Reaching here means no near-duplicate was found (a duplicate
+                # returns early above). `related` still matters: a slot-value
+                # contradiction ("dark mode" vs "light mode") is neither a
+                # conflict nor a duplicate, so proximity is the only signal.
+                verdict, reason = classify_risk(
+                    {"kind": payload.get("kind"), "claim": claim},
+                    conflict=bool(conflict), duplicate=False,
+                    related=len(related))
+                if (verdict == "auto_accept"
+                        and (self.config or {}).get("auto_accept")):
+                    conn.execute(
+                        'UPDATE proposals SET status=?, accepted_at=? '
+                        'WHERE id=? AND status=?',
+                        ('accepted', time.time(), proposal_id, 'proposed'))
             return self._load_proposal(conn, proposal_id)
 
     def get(self, proposal_id):
