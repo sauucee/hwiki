@@ -225,6 +225,18 @@ def measure_stats(vault_root: Path, *, memory_rel: Path,
                 logger.info("stats: %s could not run tests: %s", interpreter, exc)
                 continue
             match = re.search(r"(\d+) passed", out.stdout or "")
+            # A count is only a count when nothing else went wrong. "709 passed,
+            # 4 errors" matches `(\d+) passed` and would be recorded as 709 — a
+            # partial run reported as the suite total, which is the same staleness
+            # class this module exists to remove. Require a clean summary.
+            summary = (out.stdout or "").strip().splitlines()[-1] if out.stdout else ""
+            trouble = re.search(r"\b(\d+) (error|errors|failed|failure|failures)\b",
+                                summary)
+            if trouble:
+                logger.info("stats: %s ran but the suite was not green (%s); "
+                            "not recording a count", interpreter, summary.strip())
+                stats["tests_error"] = summary.strip()
+                continue
             if match:
                 stats["tests"] = int(match.group(1))
                 break

@@ -128,6 +128,10 @@ def test_a_failed_test_run_never_yields_a_count(tmp_path: Path):
     (system python has no pytest) and left the block showing an old passing number —
     exactly the staleness this module exists to remove. A run that produces no
     ``N passed`` must leave the value ``None``.
+
+    The second version parsed ``(\\d+) passed`` from any summary, so a run that
+    reported ``709 passed, 4 errors`` was recorded as 709: a partial suite written
+    as the total. Both are the same mistake in different clothes, so both are tested.
     """
     from hwiki.stats import measure_stats
 
@@ -147,6 +151,34 @@ def test_a_failed_test_run_never_yields_a_count(tmp_path: Path):
 
     assert measured["tests"] is None, (
         f"an unobserved test count became {measured['tests']!r}")
+
+
+def test_a_partial_run_is_not_recorded_as_a_total(tmp_path: Path, monkeypatch):
+    """'N passed, M errors' must not be read as N passing tests.
+
+    Measured cause of a real 709-vs-713 discrepancy: four tests errored during the
+    tick's run and the summary line still matched ``(\\d+) passed``.
+    """
+    import subprocess
+    import hwiki.stats as stats_mod
+
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+
+    class _Out:
+        stdout = "709 passed, 4 errors in 160.00s (0:02:40)\n"
+        stderr = ""
+        returncode = 1
+
+    monkeypatch.setattr(stats_mod.subprocess, "run", lambda *a, **k: _Out())
+    monkeypatch.setattr(stats_mod, "_test_interpreters", lambda: ["/usr/bin/false"])
+
+    measured = stats_mod.measure_stats(tmp_path, memory_rel=Path("mem"),
+                                       repo_dir=repo, run_tests=True)
+    assert measured["tests"] is None, (
+        f"a partial run was recorded as the total: {measured['tests']!r}")
+    assert "4 errors" in measured.get("tests_error", ""), (
+        "the reason was discarded, so the block cannot explain itself")
 
 
 def test_the_interpreter_list_prefers_a_real_pytest(tmp_path: Path):

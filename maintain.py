@@ -701,7 +701,12 @@ def _artifact_findings(store, vault_root: Path, memory_rel: Path) -> List[str]:
     for finding in getattr(report, "findings", []):
         check = str(getattr(finding, "check", ""))
         if check in CATALOG_CHECKS:
-            findings.append(f"{check}: {getattr(finding, 'page', '')}")
+            # Include the detail. The page field is the same for every catalog
+            # finding ("index.md"), so dropping the message printed the same line 7
+            # times and told the reader nothing about which pages were missing.
+            detail = str(getattr(finding, "detail", "") or "").strip()
+            page = str(getattr(finding, "page", ""))
+            findings.append(f"{check}: {page}" + (f" — {detail}" if detail else ""))
     return findings[:MAX_LISTED]
 
 
