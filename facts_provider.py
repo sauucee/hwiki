@@ -647,14 +647,41 @@ class FactsEngine:
 
     # -- extraction (side-question window) ----------------------------------
 
+    def _ask_for_facts(self, ctx, token, prompt):
+        """Run the extraction prompt and return its raw text, or None.
+
+        Preferred path is ``ctx.side_question`` with the turn's token: it reuses the
+        session's warm cache and knows the whole turn. But the host only issues that
+        token to plugins the plugin manager reports as ``enabled``, and a memory
+        provider is an *exclusive* plugin that is never enabled — it is activated by
+        ``memory.provider`` instead. So the token is always None here, and relying on
+        it alone means extraction never runs.
+
+        ``ctx.llm`` is the host-owned facade that needs no per-turn lease. It is a
+        fresh call rather than a cache hit, so it is used only when there is no token.
+        """
+        if token:
+            try:
+                return ctx.side_question(token, prompt, timeout=25.0)
+            except Exception:
+                logger.debug("facts: side_question failed (token consumed or expired)")
+                return None
+        llm = getattr(ctx, "llm", None)
+        if llm is None:
+            return None
+        try:
+            result = llm.complete(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=800, temperature=0.0,
+                purpose="hwiki.fact-extraction")
+            return getattr(result, "text", None) or None
+        except Exception as exc:
+            logger.warning("facts: ctx.llm extraction call failed: %s", exc)
+            return None
+
     def _propose_facts(self, ctx, token, prompt, user_message, session_id, project):
         store = self.store()
-        try:
-            result = ctx.side_question(token, prompt, timeout=25.0)
-        except Exception:
-            logg = logging.getLogger(__name__)
-            logg.debug("facts: side_question failed (token consumed or expired)")
-            return None
+        result = self._ask_for_facts(ctx, token, prompt)
         if not result:
             return None
         parsed = _parse_json_array(result)
@@ -703,7 +730,10 @@ class FactsEngine:
             session_id = kwargs.get('session_id', '')
             user_message = kwargs.get('user_message', '')
             project = kwargs.get('project', '')
+            # Each early return below is a reason extraction did not happen. Log it:
+            # an empty fact store must be explainable from the log, never a mystery.
             if not user_message or len(user_message.strip()) < 10:
+                logger.debug("facts: skipped (message too short: %d chars)", len((user_message or '').strip()))
                 return
 
             state = self._session(session_id)
@@ -716,7 +746,10 @@ class FactsEngine:
                 state["topics"][token] = state["topics"].get(token, 0) + 1
 
             side_question_token = kwargs.get('side_question_token')
-            if not side_question_token:
+            if not side_question_token and getattr(ctx, "llm", None) is None:
+                # No lease and no host facade: nothing can ask for facts this turn.
+                logger.info("facts: no side_question_token and no ctx.llm — deferred (session %s)",
+                            session_id)
                 with self._state_lock:
                     deferred = state.setdefault("deferred", [])
                     deferred.append(user_message)
@@ -732,6 +765,9 @@ class FactsEngine:
                           or (state["since_review"] >= 3 and state.get("chars_since_review", 0) >= 4000))
             if not forced and state.get("chars_since_review", 0) < 200:
                 review_due = False
+            if not review_due:
+                logger.debug("facts: turn counted, extraction not due yet (since_review=%s)",
+                             state.get("since_review"))
             with self._state_lock:
                 deferred = list(state.pop("deferred", []))
             try:
