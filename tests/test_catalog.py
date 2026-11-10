@@ -405,6 +405,27 @@ class DuplicateStemLinkTests(unittest.TestCase):
         self.assertEqual(resolved, catalogued)
         self.assertNotIn(None, resolved)
 
+    def test_root_page_sharing_a_stem_with_a_nested_page_stays_linkable(self):
+        """A root page is reachable by its bare stem even when a twin exists.
+
+        ``[[notes]]`` resolves to the root ``notes.md`` through the exact tier, so
+        listing it as "not linkable from an index" was wrong. The catalog used to
+        gate the bare-stem option on the stem *count*, which skipped it whenever any
+        twin existed and left a perfectly linkable page as a plain path.
+        """
+        (self.root / "notes.md").write_text("# Root notes\n", encoding="utf-8")
+        (self.root / "wiki").mkdir(parents=True, exist_ok=True)
+        (self.root / "wiki" / "notes.md").write_text("# Wiki notes\n", encoding="utf-8")
+
+        text = build_index(self.store, memory_dir="memory/auto")
+        self.assertNotIn("Not linkable from an index", text)
+        # Both pages are linked, and each link opens its own page.
+        for target in ("notes", "wiki/notes"):
+            page = self.store.resolve_page(target)
+            self.assertIsNotNone(page, f"[[{target}]] in the index does not resolve")
+        self.assertEqual(self.store.resolve_page("notes").path, "notes.md")
+        self.assertEqual(self.store.resolve_page("wiki/notes").path, "wiki/notes.md")
+
 
 class CatalogOutputContractTests(unittest.TestCase):
     """The index for an ordinary vault must stay byte-identical to the old builder.

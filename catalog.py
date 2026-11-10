@@ -436,6 +436,15 @@ def build_index(store: WikiStore, *, memory_dir: str = "",
             _record(loose_map, slugify(other.title), other)
 
     def _names_only(option: str, page) -> bool:
+        """True when ``option`` resolves to ``page`` and to nothing else via that path.
+
+        This must agree with the resolver, because the catalog's links are read back
+        with ``resolve_page``. Exact and case-folded paths are *unique* tiers — a
+        collision means no answer — and the loose slug/title tiers are deliberately
+        treated as unique too: they keep the first match, and "first" depends on
+        glob order, so a bare link is emitted only when the whole loose set names one
+        page. That is what keeps an index stable across machines.
+        """
         option = option.split("|", 1)[0].split("#", 1)[0]
         exact = exact_map.get(option)
         if exact:
@@ -454,9 +463,12 @@ def build_index(store: WikiStore, *, memory_dir: str = "",
             return None  # ``|``, ``#`` or ``]]`` in the path: no wikilink can carry it
         stem = Path(page.path).stem
         qualified = page.path[:-3] if page.path.lower().endswith(".md") else page.path
-        options = []
-        if stems.get(stem.lower(), 0) < 2:
-            options.append(stem)
+        # Try the bare stem even when another page shares it: ``_names_only`` is the
+        # authority on whether the link can mean only this page. Gating on the stem
+        # count instead made a root page unlinkable whenever a nested page shared its
+        # filename, even though ``[[notes]]`` resolves to it through the exact tier —
+        # the catalog then listed a perfectly linkable page as a plain path.
+        options = [stem]
         if qualified != stem:
             options.append(f"{qualified}|{stem}")
         for option in options:
