@@ -119,3 +119,40 @@ def test_measure_reports_what_it_can_and_none_for_what_it_cannot(tmp_path: Path)
     assert stats["pages"] is not None
     assert stats["tip"] is None, "no repo dir means the tip is unknown, not ''"
     assert stats["tests"] is None, "tests were not run, so the count is unknown"
+
+
+def test_a_failed_test_run_never_yields_a_count(tmp_path: Path):
+    """Silence is not a pass.
+
+    The first version ran ``python3 -m pytest``, which silently failed on this host
+    (system python has no pytest) and left the block showing an old passing number —
+    exactly the staleness this module exists to remove. A run that produces no
+    ``N passed`` must leave the value ``None``.
+    """
+    from hwiki.stats import measure_stats
+
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "test_nothing.py").write_text("def test_x():\n    pass\n",
+                                                    encoding="utf-8")
+    # An empty interpreter list stands in for "no interpreter can run pytest".
+    import hwiki.stats as stats_mod
+    original = stats_mod._test_interpreters
+    stats_mod._test_interpreters = lambda: []          # noqa: SLF001 - test seam
+    try:
+        measured = stats_mod.measure_stats(
+            tmp_path, memory_rel=Path("mem"), repo_dir=repo, run_tests=True)
+    finally:
+        stats_mod._test_interpreters = original        # noqa: SLF001
+
+    assert measured["tests"] is None, (
+        f"an unobserved test count became {measured['tests']!r}")
+
+
+def test_the_interpreter_list_prefers_a_real_pytest(tmp_path: Path):
+    """The candidate list must include an interpreter that can import pytest."""
+    from hwiki.stats import _test_interpreters
+    interpreters = _test_interpreters()
+    assert interpreters, "no interpreter candidates at all"
+    assert all(isinstance(i, str) and i for i in interpreters)
+    assert len(set(interpreters)) == len(interpreters), "duplicate candidates"

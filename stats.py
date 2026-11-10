@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -186,15 +187,50 @@ def measure_stats(vault_root: Path, *, memory_rel: Path,
             logger.info("stats: could not read the plugin tip: %s", exc)
 
     if run_tests and repo_dir is not None:
-        try:
-            out = subprocess.run(
-                ["python3", "-m", "pytest", "tests/", "-q"],
-                cwd=str(repo_dir), capture_output=True, text=True,
-                timeout=timeout_s)
+        # Use the interpreter that can actually import pytest, and never report a
+        # count we did not observe. Running `python3 -m pytest` here silently failed
+        # (system python has no pytest) while the block kept showing an old passing
+        # number — the precise staleness this module exists to remove. So: try the
+        # running interpreter, then the known pytest shim, and if neither works the
+        # count stays unknown.
+        for interpreter in _test_interpreters():
+            try:
+                out = subprocess.run(
+                    [interpreter, "-m", "pytest", "tests/", "-q"],
+                    cwd=str(repo_dir), capture_output=True, text=True,
+                    timeout=timeout_s)
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.info("stats: %s could not run tests: %s", interpreter, exc)
+                continue
             match = re.search(r"(\d+) passed", out.stdout or "")
             if match:
                 stats["tests"] = int(match.group(1))
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.info("stats: test run unavailable: %s", exc)
+                break
+            logger.info("stats: %s produced no passing count (exit %s): %s",
+                        interpreter, out.returncode,
+                        (out.stderr or "").strip()[-200:])
 
     return stats
+
+
+def _test_interpreters() -> list:
+    """Interpreters worth trying for the test count, most-likely first.
+
+    System ``python3`` may have no pytest at all, in which case the run produces no
+    count and the block says ``unknown`` rather than repeating an old figure.
+    """
+    candidates = [sys.executable]
+    shim = Path.home() / ".local" / "bin" / "pytest"
+    try:
+        if shim.is_file():
+            first = shim.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+            if first and first[0].startswith("#!"):
+                candidates.append(first[0][2:].strip())
+    except OSError:
+        pass
+    seen, ordered = set(), []
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            ordered.append(candidate)
+    return ordered
