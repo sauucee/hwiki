@@ -29,6 +29,7 @@ from .facts import (
     mark_superseded_page, write_session_diary, append_audit_entry,
     write_fact_canvas, resolve_vault, _tokens, _cosine_bytes,
     _atomic_write, _remove_compiled_section, _section_claim_key,
+    LifecycleLockError,
 )
 
 logger = logging.getLogger(__name__)
@@ -1010,7 +1011,11 @@ class FactsEngine:
         if tool_name == "memory_forget":
             if read_only:
                 return _readonly_error()
-            result = store.forget(proposal_id=args.get("proposal_id"), claim=args.get("claim"))
+            try:
+                result = store.forget(proposal_id=args.get("proposal_id"),
+                                      claim=args.get("claim"))
+            except LifecycleLockError as exc:
+                return tool_error(f"forget failed: {exc}")
             if result.get("ok"):
                 self._audit(f"forgot fact \"{result.get('forgot', '')[:100]}\"")
                 self._refresh_canvas()

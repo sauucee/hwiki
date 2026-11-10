@@ -1124,6 +1124,15 @@ class ProposalRejected(ValueError):
     """Raised when a proposal contains secret-shaped content."""
 
 
+class LifecycleLockError(OSError):
+    """The lifecycle lock could not be acquired.
+
+    An ``OSError`` subclass so existing ``except OSError`` callers keep working,
+    and distinct so the tool layer can turn it into a structured refusal instead
+    of letting a bare traceback escape from ``forget``/``supersede``/``compile``.
+    """
+
+
 @contextmanager
 def _db_connection(database):
     conn = sqlite3.connect(database, timeout=30, check_same_thread=False)
@@ -1160,7 +1169,14 @@ class ProposalStore:
             finally:
                 state[1] -= 1
             return
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError as exc:
+            # A bare traceback here would escape forget/supersede/compile
+            # unstructured, while every other failure in the lifecycle is a
+            # {"ok": false, "error": ...}. Fail as a typed refusal instead.
+            raise LifecycleLockError(
+                f"could not open the lifecycle lock at {lock_path}: {exc}") from exc
         try:
             if fcntl is not None:
                 fcntl.flock(fd, fcntl.LOCK_EX)
