@@ -1696,6 +1696,14 @@ class ProposalStore:
         unlinks the standalone copy.  That leftover page is byte-identical
         authority to a rebuild, so forget must reconcile it (or refuse) before
         it may report success.
+
+        Returns ``None`` when any candidate cannot be read. That is deliberate:
+        an unreadable page may be exactly the duplicate that would resurrect the
+        fact after a rebuild, so proceeding would be a guess. The trade-off is
+        liveness — one unreadable file in the memory directory blocks every forget
+        — so the refusal names the file (``_unreadable_duplicate``); fix its
+        permissions and the forget proceeds. Without the name, the block is
+        invisible and unfixable.
         """
         page_path = row.get("page_path")
         if not page_path:
@@ -1711,6 +1719,7 @@ class ProposalStore:
                     continue
                 text = page.read_text(encoding="utf-8", errors="replace")
             except OSError:
+                self._unreadable_duplicate = str(page)
                 return None
             meta = _frontmatter_dict(text)
             if str(meta.get("proposal_id") or "") == row["id"]:
@@ -1767,7 +1776,9 @@ class ProposalStore:
         """
         stale = self._stale_duplicate_pages(row)
         if stale is None:
-            return "could not read a duplicate fact page; refusing to forget"
+            where = getattr(self, "_unreadable_duplicate", "") or "a duplicate page"
+            return (f"could not read {where}; refusing to forget because it may be "
+                    "a duplicate that would resurrect this fact")
         doomed = []
         for page, text in stale:
             sections = _compiled_section_records(text)

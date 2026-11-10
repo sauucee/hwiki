@@ -166,3 +166,34 @@ def test_duplicates_are_still_removed_when_every_copy_is_safe(tmp_path: Path):
     assert not duplicate.exists(), "the stale duplicate should be gone"
     assert not Path(primary).exists(), "the primary page should be gone"
     assert store.get(fact["id"])["status"] == "deleted_by_edit"
+
+
+def test_an_unreadable_duplicate_candidate_names_itself_in_the_refusal(tmp_path: Path):
+    """The fail-closed block must be actionable, not a mystery.
+
+    Forget refuses when any page in the memory directory cannot be read, because
+    that page may be the duplicate that would resurrect the fact after a rebuild.
+    Refusing is right; refusing *anonymously* left the user with a permanent block
+    and no way to find it.
+    """
+    import os
+
+    vault, engine, store = _engine(tmp_path)
+    fact = _accept(store, BASE)
+    page = Path(engine._promote(fact["id"]))
+    assert page.exists()
+
+    unrelated = vault / MEM / "someone-elses-note.md"
+    unrelated.write_text("# handwritten\n", encoding="utf-8")
+    os.chmod(unrelated, 0o000)
+    try:
+        result = store.forget(proposal_id=fact["id"])
+        assert not result.get("ok"), (
+            "an unreadable candidate must block the forget, got "
+            f"{result}")
+        assert "someone-elses-note.md" in (result.get("error") or ""), (
+            f"the refusal does not name the blocking file: {result.get('error')!r}")
+        assert page.exists(), "a refused forget must not delete the fact page"
+        assert store.get(fact["id"])["status"] == "accepted"
+    finally:
+        os.chmod(unrelated, 0o644)
