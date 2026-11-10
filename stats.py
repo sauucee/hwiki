@@ -87,6 +87,28 @@ def render_stats_block(*, pages: Optional[int] = None,
     return "\n".join(lines)
 
 
+def block_metrics(text: str) -> Dict[str, str]:
+    """The metric rows inside a page's generated block, without the stamp.
+
+    Used to decide whether a tick has anything to write: a block that carries a
+    generation time always differs byte-wise from the previous one, so comparing raw
+    text would rewrite every page on every tick. Comparing the *metrics* keeps the
+    tick idempotent while still letting the block say when it was measured.
+    """
+    match = _BLOCK_RE.search(text or "")
+    if not match:
+        return {}
+    out: Dict[str, str] = {}
+    for line in match.group(0).splitlines():
+        line = line.strip()
+        if not line.startswith("|") or line.startswith("| ---") or "metric" in line:
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) == 2:
+            out[cells[0]] = cells[1]
+    return out
+
+
 def replace_stats_block(text: str, block: str) -> str:
     """Replace every generated block in ``text``. No markers means no change.
 

@@ -90,6 +90,35 @@ def test_a_second_tick_writes_nothing(tmp_path: Path):
         f"second tick reported {jobs['stats'].count} rewrite(s)")
 
 
+def test_the_generation_stamp_does_not_break_idempotence(tmp_path: Path):
+    """A stamped block must settle.
+
+    The block records when it was measured so a reader can judge its age. That stamp
+    changes on every render, so a byte comparison would rewrite every page on every
+    tick: the tick must compare the *metrics* instead.
+    """
+    from hwiki.stats import block_metrics
+
+    vault, store = _vault(tmp_path)
+    page = vault / "Projects" / "proj.md"
+    page.parent.mkdir(parents=True)
+    page.write_text(f"# P\n\n{STATS_START}\nx\n{STATS_END}\n", encoding="utf-8")
+
+    _tick(store, vault)
+    first = page.read_text(encoding="utf-8")
+    assert "UTC" in first, "the block should record when it was measured"
+
+    report = _tick(store, vault)
+    assert page.read_text(encoding="utf-8") == first, (
+        "the stamp made an unchanged vault rewrite itself")
+    jobs = {job.name: job for job in report.jobs}
+    assert jobs["stats"].count == 0, jobs["stats"].notes
+    # And the comparison key really does ignore the stamp.
+    assert "UTC" not in " ".join(
+        f"{k} {v}" for k, v in block_metrics(first).items()).replace("UTC", ""), (
+        "block_metrics must not include the generation stamp")
+
+
 def test_dry_run_does_not_write_but_reports_the_work(tmp_path: Path):
     vault, store = _vault(tmp_path)
     page = vault / "Projects" / "proj.md"

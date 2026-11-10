@@ -485,11 +485,13 @@ def run_maintenance(store, vault_root, memory_rel, *, embedder=None,
         stats_job.skipped = "budget"
     else:
         try:
-            from .stats import measure_stats, render_stats_block, replace_stats_block
+            from .stats import (measure_stats, render_stats_block,
+                                replace_stats_block, block_metrics)
         except ImportError:  # pragma: no cover - loaded as a top-level module
             try:
                 from stats import (  # type: ignore
-                    measure_stats, render_stats_block, replace_stats_block)
+                    measure_stats, render_stats_block, replace_stats_block,
+                    block_metrics)
             except ImportError:
                 measure_stats = None
         if measure_stats is None:
@@ -512,7 +514,12 @@ def run_maintenance(store, vault_root, memory_rel, *, embedder=None,
             block = render_stats_block(
                 pages=measured.get("pages"), chunks=measured.get("chunks"),
                 facts=measured.get("facts"), tip=measured.get("tip"),
-                tests=measured.get("tests"))
+                tests=measured.get("tests"),
+                # The block cannot be live: a test run is ~150 s and the interval is
+                # hours. So it states when it was measured, and a reader can judge
+                # the lag instead of trusting a figure of unknown age.
+                generated_at=(now or datetime.now(timezone.utc)).strftime(
+                    "%Y-%m-%d %H:%M UTC"))
             rewritten = 0
             for page in sorted(vault_root.rglob("*.md")):
                 try:
@@ -521,9 +528,11 @@ def run_maintenance(store, vault_root, memory_rel, *, embedder=None,
                     continue
                 if "<!-- hwiki:stats:start -->" not in text:
                     continue  # not opted in
+                # Compare the metrics, not the bytes: the block carries a generation
+                # stamp, so a raw comparison would rewrite every page every tick.
+                if block_metrics(text) == block_metrics(block):
+                    continue  # nothing measured has changed
                 updated = replace_stats_block(text, block)
-                if updated == text:
-                    continue  # byte-identical: do not touch the file
                 try:
                     from .facts import _atomic_write
                 except ImportError:  # pragma: no cover
