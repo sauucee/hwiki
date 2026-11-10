@@ -449,21 +449,70 @@ def related_and_conflict(claim, others, embedder,
     # reads 3/14 compatible pairs as contradictory (benchmarks/phase4-nli-verdict.md).
     # So it annotates for the reviewer instead of deciding.
     if related and (_nli_conflict_enabled() or _nli_dup_enabled()):
-        try:
-            scorer = verdict_mod.try_get_scorer()
-        except Exception:  # pragma: no cover - defensive
-            scorer = None
-        if scorer is not None:
+        # Two ways to score the same model. The worker is a one-shot subprocess:
+        # ~1 s of cold start per proposal instead of holding ~315 MB forever, which
+        # on a memory-constrained host is the better trade. The resident scorer stays
+        # the default so existing behaviour is unchanged.
+        use_worker = bool(getattr(verdict_mod, "worker_enabled", lambda: False)())
+        scorer = None
+        worker_reads = None
+        candidates = []
+        annotate = _nli_conflict_enabled()
+        for rel in related[:3]:
+            # Similarity already decided (>= 0.90) or the candidate is too distant
+            # to be a paraphrase: asking the model cannot change anything, so do not
+            # pay for it.
+            if not annotate and (best_dup_key is not None
+                                 or rel["score"] < _NLI_DUP_MIN_SCORE):
+                continue
+            candidates.append(rel)
+        if candidates and use_worker:
+            worker_reads = verdict_mod.score_pairs_via_worker(
+                [(claim, rel["text"]) for rel in candidates])
+        elif candidates:
+            try:
+                scorer = verdict_mod.try_get_scorer()
+            except Exception:  # pragma: no cover - defensive
+                scorer = None
+        if candidates and (worker_reads is not None or scorer is not None):
             annotate = _nli_conflict_enabled()
-            for rel in related[:3]:
-                # Similarity already decided (>= 0.90) or the candidate is too
-                # distant to be a paraphrase: asking the model cannot change
-                # anything, so do not pay for it.
-                if not annotate and (best_dup_key is not None
-                                     or rel["score"] < _NLI_DUP_MIN_SCORE):
-                    continue
+            # For the worker path, collect the pairs that need a reverse check and
+            # score them in ONE more subprocess rather than one per candidate.
+            reverse_reads = None
+            need_reverse: list = []
+            if worker_reads is not None:
+                need_reverse = [
+                    i for i, (c, e, _n) in enumerate(worker_reads)
+                    if c == c and e == e  # not NaN
+                    and c < verdict_mod.MIN_CONTRADICTION
+                    and e >= verdict_mod.MIN_ENTAILMENT
+                ]
+                if need_reverse:
+                    reverse_reads = verdict_mod.score_pairs_via_worker(
+                        [(candidates[i]["text"], claim) for i in need_reverse])
+            for index, rel in enumerate(candidates):
                 try:
-                    read = verdict_mod.classify_pair(claim, rel["text"], scorer)
+                    if worker_reads is not None:
+                        contrad, entail, _neutral = worker_reads[index]
+                        if contrad != contrad or entail != entail:  # NaN
+                            break
+                        reverse = None
+                        if (contrad < verdict_mod.MIN_CONTRADICTION
+                                and entail >= verdict_mod.MIN_ENTAILMENT
+                                and reverse_reads is not None
+                                and index in need_reverse):
+                            reverse = reverse_reads[need_reverse.index(index)][1]
+                        # Same decision function the resident scorer uses, so the
+                        # two paths cannot disagree about identical probabilities.
+                        relation = verdict_mod.relation_from_probabilities(
+                            contrad, entail, reverse)
+                        read = {"relation": relation,
+                                "contradiction": round(contrad, 3),
+                                "entailment": round(entail, 3)}
+                        if reverse is not None:
+                            read["entailment_reverse"] = round(reverse, 3)
+                    else:
+                        read = verdict_mod.classify_pair(claim, rel["text"], scorer)
                 except Exception:  # pragma: no cover - model hiccup
                     break
                 if annotate:

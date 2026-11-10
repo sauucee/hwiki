@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -153,3 +154,76 @@ def try_get_scorer(model_dir: Optional[Path] = None) -> Optional["NliScorer"]:
     except NliUnavailable as exc:
         logger.info("nli verdict unavailable: %s", exc)
         return None
+
+
+WORKER_TIMEOUT_S = 120
+ENV_WORKER = "HWIKI_NLI_WORKER"
+
+
+def worker_enabled() -> bool:
+    """True when verdicts should be scored in a short-lived worker.
+
+    Default OFF so existing behaviour is unchanged; set ``HWIKI_NLI_WORKER=1`` to
+    pay ~1 s of cold start per batch instead of holding ~315 MB permanently. On a
+    memory-constrained host that is the better trade by a wide margin.
+    """
+    return os.environ.get(ENV_WORKER, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def score_pairs_via_worker(
+    pairs: Sequence[Tuple[str, str]],
+    *,
+    model_dir: Optional[Path] = None,
+    timeout_s: int = WORKER_TIMEOUT_S,
+) -> Optional[List[Tuple[float, float, float]]]:
+    """Score ``pairs`` in a one-shot subprocess; ``None`` when it cannot run.
+
+    Returns one ``(contradiction, entailment, neutral)`` tuple per input, in order.
+    ``None`` means "no verdict available" — callers must degrade to no annotation,
+    never to a guess. Any pair the worker could not score comes back as NaNs, so a
+    caller can drop it without shifting the rest.
+    """
+    if not pairs:
+        return []
+    directory = Path(model_dir) if model_dir else nli_model_dir()
+    if not (directory / "model.onnx").is_file():
+        logger.info("nli worker unavailable: no model under %s", directory)
+        return None
+    worker = Path(__file__).with_name("nli_worker.py")
+    if not worker.is_file():  # pragma: no cover - packaging error
+        logger.info("nli worker script missing at %s", worker)
+        return None
+
+    payload = "".join(
+        f"{(a or '').replace(chr(9), ' ')}\t{(b or '').replace(chr(9), ' ')}\n"
+        for a, b in pairs)
+    env = dict(os.environ)
+    env[ENV_MODEL_DIR] = str(directory)
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(worker)],
+            input=payload, capture_output=True, text=True,
+            timeout=timeout_s, env=env)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.info("nli worker failed to run: %s", exc)
+        return None
+    if proc.returncode != 0:
+        logger.info("nli worker exited %s: %s", proc.returncode,
+                    (proc.stderr or "").strip()[-300:])
+        return None
+
+    out: List[Tuple[float, float, float]] = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            values = tuple(float(x) for x in line.split())
+        except ValueError:
+            values = (float("nan"),) * 3
+        if len(values) != 3:
+            values = (float("nan"),) * 3
+        out.append(values)  # type: ignore[arg-type]
+    if len(out) != len(pairs):
+        logger.info("nli worker returned %d rows for %d pairs", len(out), len(pairs))
+        return None
+    return out

@@ -49,9 +49,18 @@ import os
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 try:  # normal package import
-    from .nli import NliScorer, NliUnavailable, nli_model_dir, try_get_scorer
+    from .nli import (NliScorer, NliUnavailable, nli_model_dir, try_get_scorer,
+                      worker_enabled, score_pairs_via_worker)
 except ImportError:  # loaded as a top-level module
-    from nli import NliScorer, NliUnavailable, nli_model_dir, try_get_scorer  # type: ignore
+    from nli import (NliScorer, NliUnavailable, nli_model_dir, try_get_scorer,  # type: ignore
+                     worker_enabled, score_pairs_via_worker)
+
+__all__ = [
+    "NliScorer", "NliUnavailable", "nli_model_dir", "try_get_scorer",
+    "worker_enabled", "score_pairs_via_worker", "relation_from_probabilities",
+    "classify_pair", "is_paraphrase", "flags_contradiction", "available",
+    "frame_overlap", "MIN_CONTRADICTION", "MIN_ENTAILMENT",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +110,26 @@ def frame_overlap(a: str, b: str) -> float:
     return len(left & right) / len(left | right)
 
 
+def relation_from_probabilities(contradiction: float, entailment: float,
+                               reverse_entailment: Optional[float]) -> str:
+    """The relation decision, given the model's probabilities.
+
+    Single source of truth: ``classify_pair`` (resident scorer) and the worker
+    batch path both call this, so the two cannot drift into disagreeing about the
+    same numbers. ``reverse_entailment`` is the entailment with the pair swapped,
+    required to call a pair a restatement — a specific claim entails a general one
+    and that is a refinement, not a duplicate.
+    """
+    if contradiction >= MIN_CONTRADICTION:
+        return "contradiction"
+    if entailment >= MIN_ENTAILMENT:
+        if reverse_entailment is not None and reverse_entailment == reverse_entailment:
+            return ("restatement" if reverse_entailment >= MIN_ENTAILMENT
+                    else "compatible")
+        return "compatible"
+    return "compatible"
+
+
 def classify_pair(a: str, b: str, scorer: Optional[NliScorer] = None) -> Dict[str, Any]:
     """Relation between two claims. Raises ``NliUnavailable`` when no model exists."""
     active = scorer if scorer is not None else try_get_scorer()
@@ -109,15 +138,11 @@ def classify_pair(a: str, b: str, scorer: Optional[NliScorer] = None) -> Dict[st
     contradiction, entailment, neutral = active.probabilities(a, b)
     overlap = frame_overlap(a, b)
     reverse = None
-    if contradiction >= MIN_CONTRADICTION:
-        relation = "contradiction"
-    elif entailment >= MIN_ENTAILMENT:
+    if contradiction < MIN_CONTRADICTION and entailment >= MIN_ENTAILMENT:
         # Mutual entailment, not one-way: a specific claim entails a general one and
-        # that is a refinement, not a duplicate. Measured above.
+        # that is a refinement, not a duplicate. Measured in phase4-nli-verdict.md.
         reverse = active.probabilities(b, a)[1]
-        relation = "restatement" if reverse >= MIN_ENTAILMENT else "compatible"
-    else:
-        relation = "compatible"
+    relation = relation_from_probabilities(contradiction, entailment, reverse)
     result = {
         "relation": relation,
         "contradiction": round(contradiction, 3),
