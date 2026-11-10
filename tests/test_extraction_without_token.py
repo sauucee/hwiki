@@ -54,8 +54,11 @@ FACTS = {"facts": [
 def engine(tmp_path):
     vault = tmp_path / "vault"
     (vault / "Hermes" / "Memory" / "Auto").mkdir(parents=True)
+    # Explicit opt-in: extraction is off unless the user turns it on, so every test
+    # that expects it to run has to say so.
     eng = FactsEngine(
-        tmp_path / "home", vault, Path("Hermes/Memory/Auto"), config={})
+        tmp_path / "home", vault, Path("Hermes/Memory/Auto"),
+        config={"extract_enabled": True})
     eng.store()  # migrate
     return eng
 
@@ -165,6 +168,92 @@ def test_a_chatty_reply_proposes_nothing_and_says_why(engine, caplog):
     assert not _statuses(engine)
     assert any("failed to parse" in r.getMessage() for r in caplog.records), \
         "an unparseable reply produced no diagnostic"
+
+
+def test_extraction_off_makes_no_request_at_all(engine):
+    """``extract_enabled: false`` must mean zero LLM traffic, not "tries and gives up".
+
+    Extraction spends the user's tokens on the user's provider. A switch that still
+    builds a prompt and calls out would be a switch that only looks off.
+    """
+    eng = FactsEngine(engine.hermes_home, engine.vault_root, engine.memory_rel,
+                      config={"extract_enabled": False})
+
+    class _NeverCalled:
+        def __init__(self):
+            self.llm = self
+            self.calls = 0
+
+        def complete(self, *a, **k):
+            self.calls += 1
+            raise AssertionError("no LLM call may happen when extraction is off")
+
+        def side_question(self, *a, **k):
+            self.calls += 1
+            raise AssertionError("no side question may happen when extraction is off")
+
+    ctx = _NeverCalled()
+    state = eng._session("off-1")
+    state["force_review"] = True  # force everything that could possibly fire
+    handler = eng.hook_handler(ctx)
+    for _ in range(3):
+        handler(session_id="off-1", user_message="my dev machine runs Fedora and has 8 GB of RAM",
+                side_question_token="a-real-token", conversation_history=[])
+
+    assert ctx.calls == 0, "extraction ran while disabled"
+    assert not _statuses(eng)
+
+
+def test_extraction_off_beats_a_real_token(engine):
+    """A live token must not sneak past the switch."""
+    eng = FactsEngine(engine.hermes_home, engine.vault_root, engine.memory_rel,
+                      config={"extract_enabled": False})
+
+    calls = []
+
+    class _Ctx:
+        llm = None
+
+        def side_question(self, token, prompt, timeout=25.0):
+            calls.append(token)
+            return json.dumps(FACTS)
+
+    state = eng._session("off-2")
+    state["force_review"] = True
+    eng.hook_handler(_Ctx())(session_id="off-2",
+                             user_message="my dev machine runs Fedora and has 8 GB of RAM",
+                             side_question_token="live-token", conversation_history=[])
+
+    assert calls == [], "the side-question path ran while extraction was disabled"
+
+
+def test_extraction_is_off_when_the_key_is_absent(engine):
+    """An unconfigured store must not spend tokens: absent means off.
+
+    A cost-bearing feature that is on by default takes a decision on the user's
+    behalf that they never got to make.
+    """
+    eng = FactsEngine(engine.hermes_home, engine.vault_root, engine.memory_rel, config={})
+    called = []
+
+    class _Ctx:
+        def __init__(self):
+            self.llm = self
+
+        def complete(self, *a, **k):
+            called.append(1)
+            return _Result(json.dumps(FACTS))
+
+        def side_question(self, *a, **k):
+            called.append(1)
+            return json.dumps(FACTS)
+
+    state = eng._session("d-1")
+    state["force_review"] = True
+    eng.hook_handler(_Ctx())(session_id="d-1",
+                             user_message="my dev machine runs Fedora and has 8 GB of RAM",
+                             side_question_token="tok", conversation_history=[])
+    assert called == [], "extraction spent tokens without being opted into"
 
 
 def test_a_turn_with_no_llm_and_no_token_is_logged_not_silent(engine, caplog):

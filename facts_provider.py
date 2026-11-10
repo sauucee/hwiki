@@ -757,6 +757,11 @@ class FactsEngine:
                 state["topics"][token] = state["topics"].get(token, 0) + 1
 
             side_question_token = kwargs.get('side_question_token')
+            if not config.get("extract_enabled", False):
+                # Extraction spends the user's tokens on their own provider, so it is
+                # opt-in: absent means off. A default-on switch that costs money is a
+                # decision taken on the user's behalf that they never got to make.
+                return
             if not side_question_token and getattr(ctx, "llm", None) is None:
                 # No lease and no host facade: nothing can ask for facts this turn.
                 logger.info("facts: no side_question_token and no ctx.llm — deferred (session %s)",
