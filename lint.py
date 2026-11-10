@@ -453,6 +453,89 @@ class _Identity:
         return set()
 
 
+def orphan_pages(store, *, identity: Optional[_Identity] = None) -> List[str]:
+    """Root-relative paths of pages nothing navigates to. The single definition.
+
+    A page is an orphan when it has no inbound wikilink **and** no entry in
+    ``index.md``. That second half is the whole point of the LLM Wiki pattern: the
+    catalog is how a reader finds a page ("read the index first"), so a listed page
+    is not lost even when no other page links it.
+
+    Excludes generated artifacts and filed answers, matching :func:`_lint_orphans`:
+    those are entry points by design, and flagging them every run trains the reader
+    to ignore the check.
+
+    Kept here, beside the lint implementation, so the CLI and the lint report cannot
+    disagree about what the word means — they did, and every catalogued page was
+    printed as an orphan.
+    """
+    from .store import WikiStore  # noqa: F401  (documented input type)
+
+    root = Path(getattr(store, "root", store))
+    zone = root / str(getattr(store, "memory_dir", "") or "")
+    pages = _memory_pages(zone) if zone.is_dir() else []
+    all_pages = list(store.iter_pages()) if hasattr(store, "iter_pages") else []
+
+    identity = identity or _Identity()
+    for page in all_pages:
+        identity.add(page)
+
+    def _rel(path: Path) -> str:
+        try:
+            return path.relative_to(root).as_posix()
+        except ValueError:
+            return path.name
+
+    inbound = {}
+    for page in all_pages:
+        try:
+            text = Path(page.abspath).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        source = page.path
+        for target in _wikilink_targets(text):
+            for candidate in identity.candidates(target):
+                inbound.setdefault(candidate, set()).add(source)
+
+    listed = set()
+    index = root / "index.md"
+    if index.exists():
+        try:
+            index_text = index.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            index_text = ""
+        for target in _wikilink_targets(index_text):
+            candidates = identity.candidates(target)
+            if len(candidates) == 1:
+                listed |= candidates
+        from .catalog import linkable_target
+        for span in _code_span_targets(index_text):
+            if linkable_target(span):
+                continue
+            listed |= identity.candidates(span)
+
+    # Report on every indexed page, not just the memory zone: a curated page nothing
+    # links or lists is exactly as lost as a note.
+    orphans: List[str] = []
+    for page in all_pages:
+        rel = page.path
+        if rel.split("/")[-2:-1] == ["answers"]:
+            continue
+        try:
+            meta = _frontmatter(Path(page.abspath).read_text(encoding="utf-8",
+                                                             errors="replace"))
+        except OSError:
+            continue
+        if meta.get("status") == "generated" or meta.get("type") in ("maintenance", "log"):
+            continue
+        if rel in listed:
+            continue
+        if inbound.get(rel, set()) - {rel}:
+            continue
+        orphans.append(rel)
+    return sorted(orphans)
+
+
 def _lint_orphans(report: LintReport, root: Path, pages: Iterable[Path],
                   rel_root: Path, *, identity: Optional[_Identity] = None,
                   sources: Optional[Iterable[Path]] = None) -> None:

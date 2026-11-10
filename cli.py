@@ -308,8 +308,21 @@ def _cmd_lint(as_json: bool = False, show_info: bool = False,
                 unindexed[source] = skipped
         dangling = still_missing
     _out, backlinks = store.link_graph(key="path")
-    orphans = [p.path for p in store.iter_pages()
-               if not backlinks.get(p.path) and p.path != "index.md"]
+    # "Orphan" has one definition, and it lives in `lint._lint_orphans`: a page with
+    # no inbound link *and* no catalog entry. The CLI used to recompute it from
+    # `link_graph` alone, so every page reachable only through `index.md` — which is
+    # how this wiki is meant to be navigated ("read the catalog first") — was printed
+    # as an orphan. Two definitions of one word in one command; the module's is the
+    # documented one, so reuse it instead of restating it.
+    try:
+        from .lint import orphan_pages
+    except ImportError:  # pragma: no cover - direct-module CLI use
+        from lint import orphan_pages  # type: ignore
+    try:
+        orphans = orphan_pages(store)
+    except Exception:  # pragma: no cover - never break `lint` on a display detail
+        orphans = [p.path for p in store.iter_pages()
+                   if not backlinks.get(p.path) and p.path != "index.md"]
     counts = report.counts()
     print("\nWiki lint\n" + "-" * 46)
     print(f"  Memory pages checked: {report.pages_checked}")
