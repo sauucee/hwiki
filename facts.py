@@ -1701,11 +1701,58 @@ class ProposalStore:
                 stale.append((page, text))
         return stale
 
+    def _plan_forget(self, row, page, text: str) -> dict:
+        """Decide what a forget may do, without touching anything.
+
+        Pure: reads ``text`` and returns either ``{"error": ...}`` or
+        ``{"stripped": <new page text or None>}``. Every refusal is raised here, so
+        the caller can be sure nothing has been mutated when it declines.
+        """
+        if not text:
+            return {}  # no page on disk: nothing to plan
+        page = Path(page)
+        sections = _compiled_section_records(text)
+        meta = _frontmatter_dict(text)
+        heading = re.search(r"^# (.+)$", text, re.M)
+        owner_claim = (heading.group(1).strip() if heading
+                       else meta.get("title", page.stem))
+        owner_id = str(meta.get("proposal_id") or "")
+        is_owner = ((owner_id == row["id"]) if owner_id
+                    else (not sections
+                          and _section_claim_key(owner_claim)
+                          == _section_claim_key(row["claim"])))
+        # A page can own several accepted facts: its H1 claim plus every
+        # `compile`-merged section. Deleting the file would destroy facts the
+        # caller never asked to forget, so a merged claim is removed from the
+        # page and an owner page that still carries merged facts is not touched.
+        stripped = _remove_compiled_section(text, proposal_id=row["id"],
+                                            claim=row["claim"])
+        if stripped is not None:
+            return {"stripped": stripped}
+        if not is_owner:
+            # The row points at a shared page that no longer contains its
+            # section (stale/renamed/hand-edited). Unlinking here would delete
+            # the owner page and every other fact on it.
+            return {"error": ("page no longer contains this fact; refusing "
+                              "to delete a shared page")}
+        if sections:
+            return {"error": ("page also owns compiled facts; forget those first "
+                              "so one forget cannot delete accepted facts")}
+        return {"stripped": None}
+
     def _remove_stale_duplicates(self, row) -> Optional[str]:
-        """Delete safe stale copies; return an error string when unsafe."""
+        """Delete safe stale copies; return an error string when unsafe.
+
+        Two passes, deliberately: validate *every* copy first, then unlink. The
+        single-pass version unlinked each safe page as it went and only then hit an
+        unsafe one, so a refusal could arrive after the last on-disk copy of the
+        fact had already been deleted — a forget that reported ``ok: false`` while
+        destroying data. A refusal must leave the vault untouched.
+        """
         stale = self._stale_duplicate_pages(row)
         if stale is None:
             return "could not read a duplicate fact page; refusing to forget"
+        doomed = []
         for page, text in stale:
             sections = _compiled_section_records(text)
             heading = re.search(r"^# (.+)$", text, re.M)
@@ -1717,6 +1764,8 @@ class ProposalStore:
                     != _section_claim_key(row["claim"])):
                 return ("a duplicate page for this fact carries other facts; "
                         "refusing to forget")
+            doomed.append(page)
+        for page in doomed:
             try:
                 page.unlink()
             except OSError:
@@ -1783,37 +1832,30 @@ class ProposalStore:
             return {"ok": False, "error": "provide proposal_id or exact claim"}
         if row["status"] != "accepted":
             return {"ok": False, "error": f"fact is not accepted (status={row['status']})"}
-        duplicate_error = self._remove_stale_duplicates(row)
-        if duplicate_error:
-            return {"ok": False, "error": duplicate_error}
-        page_removed = False
-        if row.get("page_path") and Path(row["page_path"]).exists():
-            page = Path(row["page_path"])
+        # Decide everything this forget will do BEFORE touching the disk. A refusal
+        # must leave the vault byte-identical: the old order ran the duplicate
+        # cleanup first, so the "page no longer contains this fact" refusal arrived
+        # after the last on-disk copy of the fact had already been unlinked.
+        page = Path(row["page_path"]) if row.get("page_path") else None
+        page_text = ""
+        if page is not None and page.exists():
             try:
-                text = page.read_text(encoding="utf-8", errors="replace")
+                page_text = page.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 # Without the bytes we cannot prove the page belongs to this
                 # row. Deleting it could destroy unrelated accepted facts, so
                 # fail closed and leave both the page and the row untouched.
                 return {"ok": False,
                         "error": "could not read the fact page; refusing to delete it"}
-            sections = _compiled_section_records(text)
-            meta = _frontmatter_dict(text)
-            heading = re.search(r"^# (.+)$", text, re.M)
-            owner_claim = (heading.group(1).strip() if heading
-                           else meta.get("title", page.stem))
-            owner_id = str(meta.get("proposal_id") or "")
-            is_owner = ((owner_id == row["id"]) if owner_id
-                        else (not sections
-                              and _section_claim_key(owner_claim)
-                              == _section_claim_key(row["claim"])))
-            # A page can own several accepted facts: its H1 claim plus every
-            # `compile`-merged section. Deleting the file would destroy facts
-            # the caller never asked to forget, so a merged claim is removed
-            # from the page and an owner page that still carries merged facts
-            # is not touched at all.
-            stripped = _remove_compiled_section(text, proposal_id=row["id"],
-                                                claim=row["claim"])
+        plan = self._plan_forget(row, page, page_text)
+        if plan.get("error"):
+            return {"ok": False, "error": plan["error"]}
+        duplicate_error = self._remove_stale_duplicates(row)
+        if duplicate_error:
+            return {"ok": False, "error": duplicate_error}
+        page_removed = False
+        if page_text:
+            stripped = plan.get("stripped")
             if stripped is not None:
                 if not _atomic_write(page, stripped):
                     return {"ok": False,
@@ -1825,17 +1867,6 @@ class ProposalStore:
                     return {"ok": False,
                             "error": ("could not verify the shared fact page was "
                                       "reconciled; retry the forget")}
-            elif not is_owner:
-                # The row points at a shared page that no longer contains its
-                # section (stale/renamed/hand-edited). Unlinking here would
-                # delete the owner page and every other fact on it.
-                return {"ok": False,
-                        "error": ("page no longer contains this fact; refusing "
-                                  "to delete a shared page")}
-            elif sections:
-                return {"ok": False,
-                        "error": ("page also owns compiled facts; forget those first "
-                                  "so one forget cannot delete accepted facts")}
             else:
                 try:
                     page.unlink()
