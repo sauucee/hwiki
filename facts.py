@@ -1263,14 +1263,19 @@ class ProposalStore:
         # Operator settings, injected by the provider. Absent means "review
         # everything", which is the safe default for a memory system.
         self.config = config or {}
-        # Opt-in, default OFF. Env var wins so the behavior suite can toggle the
-        # capability without editing a live config file.
+        # Opt-in, default OFF. Env wins so the behavior suite can toggle the
+        # capability without editing a live config file; `facts.answerability` in
+        # hwiki.json is the durable setting, so the choice survives an env reset.
         if answerability is None:
             env = os.environ.get("HWIKI_ANSWERABILITY", "").strip().lower()
             if env in ("1", "true", "yes", "on"):
                 answerability = True
             elif env in ("0", "false", "no", "off"):
                 answerability = False
+        if answerability is None:
+            configured = (self.config or {}).get("answerability")
+            if isinstance(configured, bool):
+                answerability = configured
         self.answerability = bool(answerability)
         with _db_connection(self.database) as conn:
             conn.execute(
