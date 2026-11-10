@@ -677,7 +677,21 @@ class WikiStore:
                     "location instead"
                 )
 
-        slug = slugify(page or topic or "journal", fallback="journal")
+        # A path-shaped `page` ("Hermes/Memory/Auto/conventions") is a lookup, not a
+        # new page name. slugify() would happily flatten it into
+        # "hermesmemoryautoconventions" and create a second page beside the real one,
+        # splitting memory across two files that no longer link. Resolve the reference
+        # first and refuse rather than invent a near-duplicate.
+        reference = (page or "").strip()
+        if reference and ("/" in reference or "\\" in reference):
+            resolved = self.resolve_page(reference)
+            if resolved is None:
+                raise ValueError(
+                    f"no memory page matches {reference!r}; pass a page that exists "
+                    "or omit `page` and give a `topic` to create one")
+            slug = slugify(resolved.slug, fallback="journal")
+        else:
+            slug = slugify(page or topic or "journal", fallback="journal")
         target = self.memory_page_path(slug)
         target.parent.mkdir(parents=True, exist_ok=True)
         self.safe_write_target(target)
